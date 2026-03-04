@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import { 
   UploadCloud, Settings, Image as ImageIcon, Sparkles, 
   CheckCircle2, AlertCircle, RefreshCw, Download, 
@@ -25,9 +25,9 @@ const ImagePreviewNode = ({ url, adj, onHistogramUpdate }: any) => {
             if(w > maxW) { h = Math.round(h * (maxW / w)); w = maxW; }
             canvas.width = w;
             canvas.height = h;
-            const ctx = canvas.getContext('2d');
+            const ctx = canvas.getContext('2d', { willReadFrequently: true });
             if(!ctx) return;
-            
+
             ctx.filter = `brightness(${adj?.brightness ?? 100}%) contrast(${adj?.contrast ?? 100}%) saturate(${adj?.saturate ?? 100}%)`;
             ctx.drawImage(img, 0, 0, w, h);
             ctx.filter = 'none';
@@ -63,8 +63,29 @@ export default function BatchEditor() {
   const [model, setModel] = useState("gemini-3.1-flash-image-preview");
   const [editType, setEditType] = useState("transform");
   const [strength, setStrength] = useState(0.75);
-  const [jobId, setJobId] = useState<string | null>(null);
-  const [jobStatus, setJobStatus] = useState<any>(null);
+  // Multi-chunk job tracking: one job ID per batch of CHUNK_SIZE images
+  const [jobIds, setJobIds] = useState<string[]>([]);
+  const [jobStatuses, setJobStatuses] = useState<Record<string, any>>({});
+
+  // Backward-compat alias for single-job operations (reprocess, save)
+  const jobId = jobIds[0] ?? null;
+
+  // Merge all chunk statuses into a single virtual job status for the UI
+  const jobStatus = useMemo(() => {
+    const statuses = jobIds.map(id => jobStatuses[id]).filter(Boolean);
+    if (statuses.length === 0) return null;
+    // Enrich each item with its source job ID so reprocess can target the right job
+    const allItems = jobIds.flatMap(jid =>
+      (jobStatuses[jid]?.items || []).map((item: any) => ({ ...item, _jobId: jid }))
+    );
+    const anyProcessing = statuses.some((s: any) => s.status === "processing");
+    return {
+      status: anyProcessing ? "processing" : "completed",
+      items: allItems,
+      total_cost: statuses.reduce((sum: number, s: any) => sum + (s.total_cost || 0), 0),
+      total_time: statuses.reduce((sum: number, s: any) => sum + (s.total_time || 0), 0),
+    };
+  }, [jobIds, jobStatuses]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [presets, setPresets] = useState<any[]>([]);
   const [newPresetName, setNewPresetName] = useState("");
@@ -97,7 +118,7 @@ export default function BatchEditor() {
   useEffect(() => {
     const qJobId = searchParams.get('job_id');
     if (qJobId) {
-      setJobId(qJobId);
+      setJobIds([qJobId]);
       setIsSidebarOpen(false);
       setIsBatchSaved(true); // Se veio do dashboard, já está salvo
     }
@@ -155,51 +176,72 @@ export default function BatchEditor() {
     return URL.createObjectURL(blob);
   };
 
-  // Poll job status
+  // Poll all active job chunks every 2 seconds
   useEffect(() => {
-    if (!jobId) return;
+    if (jobIds.length === 0) return;
 
+    let active = true;
     const interval = setInterval(async () => {
+      if (!active) return;
       const headers = await getAuthHeaders();
-      fetch(`${API_URL}/jobs/${jobId}`, { headers })
-        .then((res) => res.json())
-        .then((data) => {
-          setJobStatus(data);
-          
-          // Pre-fetch blob URLs for newly completed items
-          if (data.items) {
-             data.items.forEach(async (item: any) => {
-                if (item.status === "ok" && item.output_url && !blobUrls[item.id]) {
-                   const fullUrl = `${API_URL}${item.output_url.replace('/api', '')}`;
-                   const blobUrl = await fetchBlobUrl(fullUrl.startsWith('/api') ? fullUrl : `${API_URL.replace('/api', '')}${item.output_url}`);
-                   if (blobUrl) setBlobUrls(prev => ({ ...prev, [item.id]: blobUrl }));
-                }
-             });
-          }
-          
-          if (data.status === "completed" || data.status === "error") {
-             // If a specific item was reprocessing, update its modal state
-             if (selectedItem) {
-                const updatedItem = data.items.find((i: any) => i.id === selectedItem.id);
-                if (updatedItem && updatedItem.status !== "processing") {
-                   setIsReprocessing(false);
-                   setSelectedItem(updatedItem);
-                }
-             }
 
-             // Only stop polling if EVERYTHING is truly done
-             const anyProcessing = data.items.some((i: any) => i.status === "processing");
-             if (!anyProcessing) {
-                setIsProcessing(false);
-                clearInterval(interval);
-             }
+      const snapshots = await Promise.all(
+        jobIds.map(jid =>
+          fetch(`${API_URL}/jobs/${jid}`, { headers })
+            .then(r => r.json())
+            .then(data => ({ jid, data }))
+            .catch(() => null)
+        )
+      );
+
+      if (!active) return;
+
+      // Batch-update all statuses at once to avoid multiple re-renders
+      setJobStatuses(prev => {
+        const next = { ...prev };
+        for (const snap of snapshots) {
+          if (snap) next[snap.jid] = snap.data;
+        }
+        return next;
+      });
+
+      // Pre-fetch blob URLs for newly completed items across all chunks
+      for (const snap of snapshots) {
+        if (!snap?.data?.items) continue;
+        for (const item of snap.data.items) {
+          if (item.status === "ok" && item.output_url && !blobUrls[item.id]) {
+            fetchBlobUrl(item.output_url).then(blobUrl => {
+              if (blobUrl) setBlobUrls(prev => ({ ...prev, [item.id]: blobUrl }));
+            });
           }
-        })
-        .catch((err) => console.error("Error polling job status", err));
+        }
+      }
+
+      // Determine if all jobs finished
+      const loaded = snapshots.filter(Boolean) as { jid: string; data: any }[];
+      if (loaded.length < jobIds.length) return;
+      const anyProcessing = loaded.some(s => s.data.status === "processing" ||
+        s.data.items?.some((i: any) => i.status === "processing"));
+      if (!anyProcessing) {
+        active = false;
+        clearInterval(interval);
+        setIsProcessing(false);
+        // Sync the modal item if it was being reprocessed
+        if (selectedItem) {
+          for (const { jid, data } of loaded) {
+            const updated = data.items?.find((i: any) => i.id === selectedItem.id);
+            if (updated) {
+              setIsReprocessing(false);
+              setSelectedItem({ ...updated, _jobId: jid });
+              break;
+            }
+          }
+        }
+      }
     }, 2000);
 
-    return () => clearInterval(interval);
-  }, [jobId, selectedItem]);
+    return () => { active = false; clearInterval(interval); };
+  }, [jobIds, selectedItem]);
 
   const handleDragOver = (e: React.DragEvent) => e.preventDefault();
   const handleDrop = (e: React.DragEvent) => {
@@ -211,47 +253,77 @@ export default function BatchEditor() {
   const handleProcess = async () => {
     if (!files.length || !prompt) return;
     setIsProcessing(true);
-    setIsSidebarOpen(false); // Auto-collapse sidebar
-    
-    const formData = new FormData();
-    files.forEach((f) => formData.append("files", f));
-    
-    // Concat both positive and negative constraints
-    const finalPrompt = donts.trim() ? `${prompt}\n\nO que evitar (não deve ser feito em hipótese alguma): ${donts}` : prompt;
-    formData.append("prompt", finalPrompt);
-    
-    formData.append("edit_type", editType);
-    formData.append("strength", strength.toString());
-    formData.append("model", model);
+    setIsSidebarOpen(false);
 
+    // Split into chunks so even 30+ photos never hit upload size limits
+    const CHUNK_SIZE = 8;
+    const chunks: File[][] = [];
+    for (let i = 0; i < files.length; i += CHUNK_SIZE) {
+      chunks.push(files.slice(i, i + CHUNK_SIZE));
+    }
+
+    const finalPrompt = donts.trim()
+      ? `${prompt}\n\nO que evitar (não deve ser feito em hipótese alguma): ${donts}`
+      : prompt;
+
+    let authHeaders: Record<string, string> = {};
     try {
-      const authHeaders = await getAuthHeaders();
-      const res = await fetch(`${API_URL}/jobs`, {
-        method: "POST",
-        headers: authHeaders,
-        body: formData,
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setJobId(data.job_id);
-      } else {
-        let detail = "";
-        try { detail = (await res.json()).detail || ""; } catch {}
-        if (res.status === 401 || res.status === 403) {
-          alert("Sessão inválida ou expirada. Por favor, faça login novamente.");
-        } else {
-          alert(`Erro no servidor (${res.status}): ${detail || res.statusText}`);
-        }
-        setIsProcessing(false);
-      }
-    } catch (err) {
+      authHeaders = await getAuthHeaders();
+    } catch {
       alert("Erro de conexão com o servidor. Verifique sua internet e tente novamente.");
+      setIsProcessing(false);
+      return;
+    }
+
+    // Submit all chunks in parallel
+    const results = await Promise.allSettled(
+      chunks.map(async (chunk) => {
+        const fd = new FormData();
+        chunk.forEach(f => fd.append("files", f));
+        fd.append("prompt", finalPrompt);
+        fd.append("edit_type", editType);
+        fd.append("strength", strength.toString());
+        fd.append("model", model);
+
+        const res = await fetch(`${API_URL}/jobs`, {
+          method: "POST",
+          headers: authHeaders,
+          body: fd,
+        });
+
+        if (!res.ok) {
+          let detail = "";
+          try { detail = (await res.json()).detail || ""; } catch {}
+          throw new Error(
+            (res.status === 401 || res.status === 403)
+              ? "Sessão inválida ou expirada. Por favor, faça login novamente."
+              : `Erro no servidor (${res.status}): ${detail || res.statusText}`
+          );
+        }
+
+        const data = await res.json();
+        return data.job_id as string;
+      })
+    );
+
+    const newJobIds: string[] = [];
+    const errors: string[] = [];
+    for (const r of results) {
+      if (r.status === "fulfilled") newJobIds.push(r.value);
+      else errors.push((r as PromiseRejectedResult).reason?.message || "Erro desconhecido");
+    }
+
+    if (errors.length > 0) alert(errors[0]);
+
+    if (newJobIds.length > 0) {
+      setJobIds(newJobIds);
+    } else {
       setIsProcessing(false);
     }
   };
 
   const handleSaveBatch = async () => {
-    if (!user || !jobId) return;
+    if (!user || !jobIds.length) return;
     
     setIsSavingBatch(true);
     const finalStatus = jobStatus?.items?.some((i: any) => i.status === "processing") ? "processing" : "completed";
@@ -275,21 +347,23 @@ export default function BatchEditor() {
   };
 
   const handleReprocess = async () => {
-    if (!selectedItem || !jobId || !reprocessPrompt) return;
-    
+    // Use the item's own job ID (set when merging statuses) or fall back to first chunk
+    const targetJobId = selectedItem?._jobId || jobIds[0];
+    if (!selectedItem || !targetJobId || !reprocessPrompt) return;
+
     setIsReprocessing(true);
     const formData = new FormData();
-    
+
     const finalReprocessPrompt = reprocessDonts.trim() ? `${reprocessPrompt}\n\nO que evitar (não deve ser feito em hipótese alguma): ${reprocessDonts}` : reprocessPrompt;
     formData.append("prompt", finalReprocessPrompt);
-    
+
     formData.append("edit_type", editType);
     formData.append("strength", reprocessStrength.toString());
     formData.append("model", model);
 
     try {
       const authHeaders = await getAuthHeaders();
-      await fetch(`${API_URL}/jobs/${jobId}/reprocess/${selectedItem.id}`, {
+      await fetch(`${API_URL}/jobs/${targetJobId}/reprocess/${selectedItem.id}`, {
         method: "POST",
         headers: authHeaders,
         body: formData,
@@ -302,19 +376,26 @@ export default function BatchEditor() {
   };
 
   const handleDownloadZip = async () => {
-    if (!jobId) return;
+    if (!jobIds.length) return;
     setIsDownloadingZip(true);
     try {
       const authHeaders = await getAuthHeaders();
-      const res = await fetch(`${API_URL}/jobs/${jobId}/download`, { headers: authHeaders });
-      if (!res.ok) { alert("Erro ao baixar ZIP"); return; }
-      const blob = await res.blob();
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = `bananabatch_${jobId}.zip`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
+      const usePartSuffix = jobIds.length > 1;
+      for (let i = 0; i < jobIds.length; i++) {
+        const jid = jobIds[i];
+        const res = await fetch(`${API_URL}/jobs/${jid}/download`, { headers: authHeaders });
+        if (!res.ok) { alert(`Erro ao baixar ZIP (parte ${i + 1})`); continue; }
+        const blob = await res.blob();
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = usePartSuffix
+          ? `bananabatch_parte${i + 1}.zip`
+          : `bananabatch_${jid}.zip`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(a.href);
+      }
     } catch (err) {
       console.error(err);
       alert("Erro ao baixar ZIP");
@@ -364,7 +445,7 @@ export default function BatchEditor() {
       canvas.width = img.width;
       canvas.height = img.height;
       
-      const ctx = canvas.getContext("2d");
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
       if (ctx) {
          ctx.filter = `brightness(${adj.brightness}%) contrast(${adj.contrast}%) saturate(${adj.saturate}%)`;
          ctx.drawImage(img, 0, 0);
@@ -730,8 +811,8 @@ export default function BatchEditor() {
                   <div className="flex justify-center pt-8">
                      <button 
                        onClick={() => {
-                         setJobId(null);
-                         setJobStatus(null);
+                         setJobIds([]);
+                         setJobStatuses({});
                          setFiles([]);
                          setIsSidebarOpen(true);
                          setIsBatchSaved(false);
