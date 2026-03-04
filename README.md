@@ -13,6 +13,7 @@ pip install -e .
 ```
 
 Set your API key:
+
 ```bash
 export GEMINI_API_KEY=your_key_here  # or add to .env file
 ```
@@ -38,6 +39,7 @@ bananabatch edit -i edits.csv -d ./images/
 # Single image with multiple edits (e.g., defect generation)
 bananabatch edit -i defects.csv --default-image product.jpg -t "Add a {{ defect }} at {{ location }}"
 ```
+
 <img width="787" height="403" alt="Gemini_Generated_Image_8wmv78wmv78wmv78" src="https://github.com/user-attachments/assets/1ba6c799-3fda-4a32-9f09-aeaf6dea37e2" />
 
 ### GUI
@@ -57,6 +59,7 @@ A robot playing guitar,robot
 ```
 
 Or with template variables:
+
 ```csv
 item,style
 mountain,watercolor
@@ -71,6 +74,7 @@ photo.jpg,Add warm lighting,transform,0.7
 ```
 
 Or without `base_image` column when using `--default-image`:
+
 ```csv
 defect_type,location
 scratch,center
@@ -81,24 +85,24 @@ dent,corner
 
 ### Generate Options
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-i, --input` | Required | CSV/JSON input file |
-| `-m, --model` | `gemini-2.5-flash-image` | Model to use |
-| `-o, --output` | `outputs/` | Output directory |
-| `-t, --template` | None | Jinja2 template |
-| `-w, --workers` | 5 | Concurrent workers |
+| Flag             | Default                          | Description         |
+| ---------------- | -------------------------------- | ------------------- |
+| `-i, --input`    | Required                         | CSV/JSON input file |
+| `-m, --model`    | `gemini-3.1-flash-image-preview` | Model to use        |
+| `-o, --output`   | `outputs/`                       | Output directory    |
+| `-t, --template` | None                             | Jinja2 template     |
+| `-w, --workers`  | 5                                | Concurrent workers  |
 
 ### Edit Options
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-i, --input` | Required | CSV/JSON with edit instructions |
-| `-d, --images` | None | Base images directory |
-| `-b, --default-image` | None | Default image for all rows |
-| `-e, --type` | `transform` | Edit type |
-| `-s, --strength` | 0.75 | Edit intensity (0-1) |
-| `-w, --workers` | 2 | Concurrent workers |
+| Flag                  | Default     | Description                     |
+| --------------------- | ----------- | ------------------------------- |
+| `-i, --input`         | Required    | CSV/JSON with edit instructions |
+| `-d, --images`        | None        | Base images directory           |
+| `-b, --default-image` | None        | Default image for all rows      |
+| `-e, --type`          | `transform` | Edit type                       |
+| `-s, --strength`      | 0.75        | Edit intensity (0-1)            |
+| `-w, --workers`       | 2           | Concurrent workers              |
 
 ### Edit Types
 
@@ -110,7 +114,7 @@ dent,corner
 
 ## Models
 
-- `gemini-2.5-flash-image` - Fast (default)
+- `gemini-3.1-flash-image-preview` - Fast (default)
 - `gemini-3-pro-image-preview` - Higher quality
 
 ## Development

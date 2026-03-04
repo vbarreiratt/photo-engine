@@ -29,19 +29,19 @@ class GeminiProvider(ImageProvider):
 
     Attributes:
         api_key: The Gemini API key.
-        default_model: The default model to use (defaults to gemini-2.5-flash-image).
+        default_model: The default model to use (defaults to gemini-3.1-flash-image-preview).
         client: The initialized Gemini client.
     """
 
     SUPPORTED_MODELS = [
-        "gemini-2.5-flash-image",
+        "gemini-3.1-flash-image-preview",
         "gemini-3-pro-image-preview",
     ]
 
     def __init__(
         self,
         api_key: str,
-        default_model: str = "gemini-2.5-flash-image",
+        default_model: str = "gemini-3.1-flash-image-preview",
     ) -> None:
         """Initialize the Gemini provider.
 

@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Optional
 
 import aiofiles
+import io
+from PIL import Image
 from jinja2 import Environment, TemplateError, UndefinedError
 
 from bananabatch.core.models import (
@@ -580,6 +582,7 @@ class BatchEditProcessor:
         self.progress = BatchProgress()
         self._results: list[ImageResult] = []
         self._progress_callback: Optional[Callable[[BatchProgress], None]] = None
+        self._status_callback: Optional[Callable[[str, str], None]] = None
 
     def set_progress_callback(
         self,
@@ -592,10 +595,26 @@ class BatchEditProcessor:
         """
         self._progress_callback = callback
 
+    def set_status_callback(
+        self,
+        callback: Callable[[str, str], None],
+    ) -> None:
+        """Set a callback for sub-status changes.
+
+        Args:
+            callback: Function taking (request_id, status_message)
+        """
+        self._status_callback = callback
+
     def _notify_progress(self) -> None:
         """Notify the progress callback of current progress."""
         if self._progress_callback:
             self._progress_callback(self.progress)
+
+    def _notify_status(self, request_id: str, message: str) -> None:
+        """Notify of a sub-status update."""
+        if self._status_callback:
+            self._status_callback(request_id, message)
 
     async def process(self) -> list[ImageResult]:
         """Run the batch editing job.
@@ -732,6 +751,35 @@ class BatchEditProcessor:
 
         return requests
 
+    def _adjust_image_data(self, base_image_path: Path, generated_image_data: bytes) -> tuple[bytes, str]:
+        """Restore original dimensions and format to the generated image."""
+        base_img = Image.open(base_image_path)
+        orig_size = base_img.size
+        orig_format = base_img.format or "JPEG"
+        orig_ext = base_image_path.suffix.lower()
+        if orig_ext not in [".jpg", ".jpeg", ".png", ".webp", ".gif"]:
+            orig_ext = ".jpg" if orig_format in ["JPEG", "JPG"] else f".{orig_format.lower()}"
+
+        gen_img = Image.open(io.BytesIO(generated_image_data))
+        if gen_img.size != orig_size:
+            gen_img = gen_img.resize(orig_size, Image.Resampling.LANCZOS)
+        
+        if orig_format in ["JPEG", "JPG"] and gen_img.mode in ("RGBA", "P"):
+            gen_img = gen_img.convert("RGB")
+
+        exif = base_img.info.get('exif')
+        dpi = base_img.info.get('dpi', (300, 300))
+        if dpi[0] < 150:
+            dpi = (300, 300)
+
+        out_buffer = io.BytesIO()
+        save_kwargs = {"format": orig_format, "quality": 100, "dpi": dpi}
+        if exif:
+            save_kwargs["exif"] = exif
+            
+        gen_img.save(out_buffer, **save_kwargs)
+        return out_buffer.getvalue(), orig_ext
+
     async def _process_single_edit(self, request: ImageEditRequest) -> ImageResult:
         """Process a single image edit request.
 
@@ -744,10 +792,13 @@ class BatchEditProcessor:
         self.progress.pending -= 1
         self.progress.in_progress += 1
         self._notify_progress()
+        self._notify_status(request.id, "Aguardando envio...")
 
         start_time = time.time()
 
         try:
+            self._notify_status(request.id, "Enviando para Nuvem (Vertex AI)...")
+            
             # Edit image
             image_data = await self.provider.edit(
                 base_image=request.base_image,
@@ -756,16 +807,31 @@ class BatchEditProcessor:
                 model=request.model.value,
                 strength=request.strength,
             )
+            
+            self._notify_status(request.id, "Realizando upscale em dimensões originais...")
+            
+            # Restore size and format
+            loop = asyncio.get_event_loop()
+            image_data, orig_ext = await loop.run_in_executor(
+                None,
+                self._adjust_image_data,
+                request.base_image,
+                image_data,
+            )
 
             generation_time = (time.time() - start_time) * 1000
+
+            self._notify_status(request.id, "Salvando arte final no disco...")
 
             # Generate filename
             if request.output_filename:
                 filename = request.output_filename
+                if not any(filename.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"]):
+                    filename = f"{filename}{orig_ext}"
             else:
                 # Create filename from base image name + edit type
                 base_stem = request.base_image.stem
-                filename = f"{base_stem}_{request.edit_type.value}_{request.id[:8]}"
+                filename = f"{base_stem}_{request.edit_type.value}_{request.id[:8]}{orig_ext}"
 
             # Save image
             output_path = await self.file_manager.save_image(

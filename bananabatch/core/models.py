@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field, field_validator
 class ModelName(str, Enum):
     """Supported Gemini model names for image generation."""
 
-    GEMINI_FLASH = "gemini-2.5-flash-image"
+    GEMINI_FLASH = "gemini-3.1-flash-image-preview"
     GEMINI_PRO = "gemini-3-pro-image-preview"
 
 
