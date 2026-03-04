@@ -75,9 +75,14 @@ export default function BatchEditor() {
   const [reprocessPrompt, setReprocessPrompt] = useState("");
   const [reprocessStrength, setReprocessStrength] = useState(0.75);
   const [isReprocessing, setIsReprocessing] = useState(false);
+  const [donts, setDonts] = useState("");
+  const [reprocessDonts, setReprocessDonts] = useState("");
   const [adjustments, setAdjustments] = useState<Record<string, { brightness: number, contrast: number, saturate: number, points: {x:number, y:number}[], histogram?: number[] }>>({});
   const [isBatchSaved, setIsBatchSaved] = useState(false);
   const [isSavingBatch, setIsSavingBatch] = useState(false);
+  const [isDownloadingZip, setIsDownloadingZip] = useState(false);
+  // Map of item.id -> authenticated blob URL for image display
+  const [blobUrls, setBlobUrls] = useState<Record<string, string>>({});
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -111,6 +116,7 @@ export default function BatchEditor() {
       id: Date.now().toString(),
       name: newPresetName,
       prompt,
+      donts,
       model,
       editType,
       strength,
@@ -126,6 +132,7 @@ export default function BatchEditor() {
     const preset = presets.find((p) => p.id === presetId);
     if (preset) {
       setPrompt(preset.prompt);
+      setDonts(preset.donts || "");
       // Migrate old preset values automatically
       let modelToLoad = preset.model;
       if (modelToLoad === "gemini-2.5-pro-image") {
@@ -139,6 +146,15 @@ export default function BatchEditor() {
     }
   };
 
+  // Fetch image via authenticated request and return a local blob URL
+  const fetchBlobUrl = async (apiUrl: string): Promise<string> => {
+    const headers = await getAuthHeaders();
+    const res = await fetch(apiUrl, { headers });
+    if (!res.ok) return "";
+    const blob = await res.blob();
+    return URL.createObjectURL(blob);
+  };
+
   // Poll job status
   useEffect(() => {
     if (!jobId) return;
@@ -149,6 +165,17 @@ export default function BatchEditor() {
         .then((res) => res.json())
         .then((data) => {
           setJobStatus(data);
+          
+          // Pre-fetch blob URLs for newly completed items
+          if (data.items) {
+             data.items.forEach(async (item: any) => {
+                if (item.status === "ok" && item.output_url && !blobUrls[item.id]) {
+                   const fullUrl = `${API_URL}${item.output_url.replace('/api', '')}`;
+                   const blobUrl = await fetchBlobUrl(fullUrl.startsWith('/api') ? fullUrl : `${API_URL.replace('/api', '')}${item.output_url}`);
+                   if (blobUrl) setBlobUrls(prev => ({ ...prev, [item.id]: blobUrl }));
+                }
+             });
+          }
           
           if (data.status === "completed" || data.status === "error") {
              // If a specific item was reprocessing, update its modal state
@@ -188,7 +215,11 @@ export default function BatchEditor() {
     
     const formData = new FormData();
     files.forEach((f) => formData.append("files", f));
-    formData.append("prompt", prompt);
+    
+    // Concat both positive and negative constraints
+    const finalPrompt = donts.trim() ? `${prompt}\n\nO que evitar (não deve ser feito em hipótese alguma): ${donts}` : prompt;
+    formData.append("prompt", finalPrompt);
+    
     formData.append("edit_type", editType);
     formData.append("strength", strength.toString());
     formData.append("model", model);
@@ -242,7 +273,10 @@ export default function BatchEditor() {
     
     setIsReprocessing(true);
     const formData = new FormData();
-    formData.append("prompt", reprocessPrompt);
+    
+    const finalReprocessPrompt = reprocessDonts.trim() ? `${reprocessPrompt}\n\nO que evitar (não deve ser feito em hipótese alguma): ${reprocessDonts}` : reprocessPrompt;
+    formData.append("prompt", finalReprocessPrompt);
+    
     formData.append("edit_type", editType);
     formData.append("strength", reprocessStrength.toString());
     formData.append("model", model);
@@ -263,21 +297,30 @@ export default function BatchEditor() {
 
   const handleDownloadZip = async () => {
     if (!jobId) return;
-    const authHeaders = await getAuthHeaders();
-    const res = await fetch(`${API_URL}/jobs/${jobId}/download`, { headers: authHeaders });
-    if (!res.ok) { alert("Erro ao baixar ZIP"); return; }
-    const blob = await res.blob();
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `bananabatch_${jobId}.zip`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    setIsDownloadingZip(true);
+    try {
+      const authHeaders = await getAuthHeaders();
+      const res = await fetch(`${API_URL}/jobs/${jobId}/download`, { headers: authHeaders });
+      if (!res.ok) { alert("Erro ao baixar ZIP"); return; }
+      const blob = await res.blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `bananabatch_${jobId}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } catch (err) {
+      console.error(err);
+      alert("Erro ao baixar ZIP");
+    } finally {
+      setIsDownloadingZip(false);
+    }
   };
 
   const openItemModal = (item: any) => {
     setSelectedItem(item);
     setReprocessPrompt(prompt); // load original prompt as suggestion
+    setReprocessDonts(donts); // load original donts as suggestion
     setReprocessStrength(strength);
   };
 
@@ -455,6 +498,18 @@ export default function BatchEditor() {
             />
           </div>
 
+          <div className="space-y-4">
+            <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider flex items-center gap-2">
+              O que evitar (Donts)
+            </h2>
+            <textarea
+              value={donts}
+              onChange={(e) => setDonts(e.target.value)}
+              placeholder="Ex: sem alterar a pessoa, sem rostos distorcidos, sem fundo branco..."
+              className="w-full h-20 bg-slate-50 border border-slate-200 rounded p-3 text-sm resize-none outline-none focus:border-red-400 focus:ring-1 focus:ring-red-400/20 transition-all text-red-900 placeholder:text-red-300"
+            />
+          </div>
+
           <div className="pt-2 border-t border-slate-100 flex gap-2">
              <input type="text" placeholder="Nome do Preset" value={newPresetName} onChange={e => setNewPresetName(e.target.value)} className="w-[60%] bg-white border border-slate-200 rounded text-xs p-2 outline-none" />
              <button onClick={savePreset} disabled={!newPresetName} className="flex-1 bg-slate-200 text-slate-700 disabled:opacity-50 text-xs rounded font-medium hover:bg-slate-300 transition-colors">Salvar Preset</button>
@@ -521,9 +576,15 @@ export default function BatchEditor() {
               </button>
               <button 
                 onClick={handleDownloadZip}
-                className="flex items-center gap-2 px-4 py-2 bg-slate-800 text-white text-sm font-medium rounded hover:bg-slate-900 shadow-sm transition-colors"
+                disabled={isDownloadingZip}
+                className="flex items-center gap-2 px-4 py-2 bg-slate-800 text-white text-sm font-medium rounded hover:bg-slate-900 shadow-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed w-[180px] justify-center"
               >
-                <Archive className="w-4 h-4"/> Baixar Tudo (.zip)
+                {isDownloadingZip ? (
+                  <RefreshCw className="w-4 h-4 animate-spin"/>
+                ) : (
+                  <Archive className="w-4 h-4"/>
+                )}
+                {isDownloadingZip ? "Compactando..." : "Baixar Tudo (.zip)"}
               </button>
             </div>
           )}
@@ -606,7 +667,11 @@ export default function BatchEditor() {
                          onClick={() => openItemModal(item)}
                       >
                         {item.status === "ok" && item.output_url ? (
-                          <img src={`${API_URL.replace('/api','')}${item.output_url}`} className="object-cover w-full h-full transform group-hover:scale-105 transition-transform duration-500" alt="Resultado" />
+                          <img 
+                            src={blobUrls[item.id] || ""} 
+                            className={`object-cover w-full h-full transform group-hover:scale-105 transition-transform duration-500 ${!blobUrls[item.id] ? 'opacity-0' : 'opacity-100'}`} 
+                            alt="Resultado" 
+                          />
                         ) : item.status === "processing" ? (
                           <div className="flex flex-col items-center justify-center p-3 text-center w-full">
                               <RefreshCw className="w-5 h-5 text-primary animate-spin mb-3 shadow-none" />
@@ -641,7 +706,7 @@ export default function BatchEditor() {
                            <button 
                              onClick={(e) => {
                                 e.stopPropagation();
-                                const url = `${API_URL.replace('/api','')}${item.output_url}`;
+                                const url = blobUrls[item.id] || `${API_URL.replace('/api','')}${item.output_url}`;
                                 const filename = item.output_url.split('/').pop() || 'image.jpg';
                                 downloadSingleImage(url, filename);
                              }}
@@ -692,7 +757,7 @@ export default function BatchEditor() {
                <div className="flex-1 bg-slate-100 relative min-h-[300px] min-w-0 flex items-center justify-center p-4">
                    {selectedItem.status === "ok" && selectedItem.output_url ? (
                       <ImagePreviewNode 
-                           url={`${API_URL.replace('/api','')}${selectedItem.output_url}`}
+                           url={blobUrls[selectedItem.id] || `${API_URL.replace('/api','')}${selectedItem.output_url}`}
                            adj={adjustments[selectedItem.id]}
                            onHistogramUpdate={(hist: number[]) => {
                                setAdjustments(prev => {
@@ -807,6 +872,16 @@ export default function BatchEditor() {
                         />
                      </div>
 
+                     <div className="space-y-2 mt-4">
+                        <label className="text-sm font-semibold text-slate-700">O que evitar (Donts)</label>
+                        <textarea 
+                           className="w-full h-16 bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm resize-none outline-none focus:border-red-400 focus:ring-1 transition-all text-red-900 placeholder:text-red-300"
+                           placeholder="Ex: sem alterar as bordas, não escurecer a imagem..."
+                           value={reprocessDonts}
+                           onChange={e => setReprocessDonts(e.target.value)}
+                        />
+                     </div>
+
                      <div className="space-y-2">
                         <div className="flex justify-between">
                            <label className="text-sm font-semibold text-slate-700">Força da Variação</label>
@@ -826,7 +901,7 @@ export default function BatchEditor() {
                      {selectedItem.status === "ok" && selectedItem.output_url && (
                         <button 
                            onClick={() => {
-                              const url = `${API_URL.replace('/api','')}${selectedItem.output_url}`;
+                              const url = blobUrls[selectedItem.id] || `${API_URL.replace('/api','')}${selectedItem.output_url}`;
                               const filename = selectedItem.output_url.split('/').pop() || 'image.jpg';
                               downloadSingleImage(url, filename, adjustments[selectedItem.id]);
                            }}
