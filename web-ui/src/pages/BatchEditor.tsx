@@ -7,7 +7,7 @@ import {
 import { CurvesEditor, computeImageHistogram, applyLUT, computeSplineLUT } from "../components/CurvesEditor";
 
 // API configs
-const API_URL = "http://localhost:8000/api";
+const API_URL = (import.meta.env.VITE_API_URL as string) ?? "/api";
 
 const ImagePreviewNode = ({ url, adj, onHistogramUpdate }: any) => {
     const canvasRef = useRef<HTMLCanvasElement>(null);
