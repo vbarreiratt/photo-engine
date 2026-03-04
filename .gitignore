@@ -119,6 +119,7 @@ dmypy.json
 # Output directories
 outputs/
 temp_input.csv
+deploy_VPS.md
 
 # OS generated files
 .DS_Store
