@@ -231,15 +231,21 @@ export default function BatchEditor() {
         headers: authHeaders,
         body: formData,
       });
-      const data = await res.json();
       if (res.ok) {
+        const data = await res.json();
         setJobId(data.job_id);
       } else {
-        alert("Server error: " + (data.detail || ""));
+        let detail = "";
+        try { detail = (await res.json()).detail || ""; } catch {}
+        if (res.status === 401 || res.status === 403) {
+          alert("Sessão inválida ou expirada. Por favor, faça login novamente.");
+        } else {
+          alert(`Erro no servidor (${res.status}): ${detail || res.statusText}`);
+        }
         setIsProcessing(false);
       }
     } catch (err) {
-      alert("Error connecting to backend.");
+      alert("Erro de conexão com o servidor. Verifique sua internet e tente novamente.");
       setIsProcessing(false);
     }
   };
