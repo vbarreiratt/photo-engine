@@ -1,0 +1,858 @@
+import { useState, useRef, useEffect } from "react";
+import { 
+  UploadCloud, Settings, Image as ImageIcon, Sparkles, 
+  CheckCircle2, AlertCircle, RefreshCw, Download, 
+  Maximize2, X, ChevronLeft, ChevronRight, Archive, ArrowLeft, Save, Plus
+} from "lucide-react";
+import { CurvesEditor, computeImageHistogram, applyLUT, computeSplineLUT } from "../components/CurvesEditor";
+
+// API configs
+const API_URL = "http://localhost:8000/api";
+
+const ImagePreviewNode = ({ url, adj, onHistogramUpdate }: any) => {
+    const canvasRef = useRef<HTMLCanvasElement>(null);
+
+    useEffect(() => {
+        const img = new Image();
+        img.crossOrigin = "anonymous";
+        img.src = url;
+        img.onload = () => {
+            const canvas = canvasRef.current;
+            if(!canvas) return;
+            const maxW = 1200;
+            let w = img.width;
+            let h = img.height;
+            if(w > maxW) { h = Math.round(h * (maxW / w)); w = maxW; }
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            if(!ctx) return;
+            
+            ctx.filter = `brightness(${adj?.brightness ?? 100}%) contrast(${adj?.contrast ?? 100}%) saturate(${adj?.saturate ?? 100}%)`;
+            ctx.drawImage(img, 0, 0, w, h);
+            ctx.filter = 'none';
+
+            const imgData = ctx.getImageData(0, 0, w, h);
+            
+            // Decouple histogram update to avoid render loops
+            const hist = computeImageHistogram(imgData);
+            if(onHistogramUpdate) {
+                setTimeout(() => onHistogramUpdate(hist), 0);
+            }
+
+            if (adj?.points && adj.points.length >= 2) {
+                const lut = computeSplineLUT(adj.points);
+                applyLUT(imgData, lut);
+                ctx.putImageData(imgData, 0, 0);
+            }
+        };
+    }, [url, adj]); // removed onHistogramUpdate intentionally to prevent loop
+
+    return <canvas ref={canvasRef} className="max-w-full max-h-full object-contain transition-none shadow-lg rounded" />;
+};
+
+import { supabase } from "../lib/supabase";
+import { useAuth } from "../contexts/AuthContext";
+import { Link, useSearchParams } from "react-router-dom";
+
+export default function BatchEditor() {
+  const { user } = useAuth();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [files, setFiles] = useState<File[]>([]);
+  const [prompt, setPrompt] = useState("");
+  const [model, setModel] = useState("gemini-3.1-flash-image-preview");
+  const [editType, setEditType] = useState("transform");
+  const [strength, setStrength] = useState(0.75);
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [jobStatus, setJobStatus] = useState<any>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [presets, setPresets] = useState<any[]>([]);
+  const [newPresetName, setNewPresetName] = useState("");
+  
+  // UI States
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [selectedItem, setSelectedItem] = useState<any | null>(null);
+  const [reprocessPrompt, setReprocessPrompt] = useState("");
+  const [reprocessStrength, setReprocessStrength] = useState(0.75);
+  const [isReprocessing, setIsReprocessing] = useState(false);
+  const [adjustments, setAdjustments] = useState<Record<string, { brightness: number, contrast: number, saturate: number, points: {x:number, y:number}[], histogram?: number[] }>>({});
+  const [isBatchSaved, setIsBatchSaved] = useState(false);
+  const [isSavingBatch, setIsSavingBatch] = useState(false);
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Helper: get Supabase JWT to send as Bearer token to the backend
+  const getAuthHeaders = async (): Promise<Record<string, string>> => {
+    const { data: { session } } = await supabase.auth.getSession();
+    const token = session?.access_token;
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  };
+
+  // Initialize from URL search parameters if accessing from Dashboard
+  useEffect(() => {
+    const qJobId = searchParams.get('job_id');
+    if (qJobId) {
+      setJobId(qJobId);
+      setIsSidebarOpen(false);
+      setIsBatchSaved(true); // Se veio do dashboard, já está salvo
+    }
+  }, [searchParams]);
+
+  useEffect(() => {
+    const saved = localStorage.getItem("banana_presets");
+    if (saved) {
+      setPresets(JSON.parse(saved));
+    }
+  }, []);
+
+  const savePreset = () => {
+    if (!newPresetName) return;
+    const newPreset = {
+      id: Date.now().toString(),
+      name: newPresetName,
+      prompt,
+      model,
+      editType,
+      strength,
+    };
+    const updated = [...presets, newPreset];
+    setPresets(updated);
+    localStorage.setItem("banana_presets", JSON.stringify(updated));
+    setNewPresetName("");
+  };
+
+  const loadPreset = (presetId: string) => {
+    if (!presetId) return;
+    const preset = presets.find((p) => p.id === presetId);
+    if (preset) {
+      setPrompt(preset.prompt);
+      // Migrate old preset values automatically
+      let modelToLoad = preset.model;
+      if (modelToLoad === "gemini-2.5-pro-image") {
+          modelToLoad = "gemini-3-pro-image-preview";
+      } else if (modelToLoad === "gemini-2.5-flash-image") {
+          modelToLoad = "gemini-3.1-flash-image-preview";
+      }
+      setModel(modelToLoad);
+      setEditType(preset.editType);
+      setStrength(preset.strength);
+    }
+  };
+
+  // Poll job status
+  useEffect(() => {
+    if (!jobId) return;
+
+    const interval = setInterval(async () => {
+      const headers = await getAuthHeaders();
+      fetch(`${API_URL}/jobs/${jobId}`, { headers })
+        .then((res) => res.json())
+        .then((data) => {
+          setJobStatus(data);
+          
+          if (data.status === "completed" || data.status === "error") {
+             // If a specific item was reprocessing, update its modal state
+             if (selectedItem) {
+                const updatedItem = data.items.find((i: any) => i.id === selectedItem.id);
+                if (updatedItem && updatedItem.status !== "processing") {
+                   setIsReprocessing(false);
+                   setSelectedItem(updatedItem);
+                }
+             }
+
+             // Only stop polling if EVERYTHING is truly done
+             const anyProcessing = data.items.some((i: any) => i.status === "processing");
+             if (!anyProcessing) {
+                setIsProcessing(false);
+                clearInterval(interval);
+             }
+          }
+        })
+        .catch((err) => console.error("Error polling job status", err));
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [jobId, selectedItem]);
+
+  const handleDragOver = (e: React.DragEvent) => e.preventDefault();
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    const droppedFiles = Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith("image/"));
+    setFiles((prev) => [...prev, ...droppedFiles]);
+  };
+
+  const handleProcess = async () => {
+    if (!files.length || !prompt) return;
+    setIsProcessing(true);
+    setIsSidebarOpen(false); // Auto-collapse sidebar
+    
+    const formData = new FormData();
+    files.forEach((f) => formData.append("files", f));
+    formData.append("prompt", prompt);
+    formData.append("edit_type", editType);
+    formData.append("strength", strength.toString());
+    formData.append("model", model);
+
+    try {
+      const authHeaders = await getAuthHeaders();
+      const res = await fetch(`${API_URL}/jobs`, {
+        method: "POST",
+        headers: authHeaders,
+        body: formData,
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setJobId(data.job_id);
+      } else {
+        alert("Server error: " + (data.detail || ""));
+        setIsProcessing(false);
+      }
+    } catch (err) {
+      alert("Error connecting to backend.");
+      setIsProcessing(false);
+    }
+  };
+
+  const handleSaveBatch = async () => {
+    if (!user || !jobId) return;
+    
+    setIsSavingBatch(true);
+    const finalStatus = jobStatus?.items?.some((i: any) => i.status === "processing") ? "processing" : "completed";
+    
+    const { error } = await supabase.from("batches").insert([{ 
+       user_id: user.id, 
+       job_id: jobId, 
+       prompt: prompt,
+       model: model,
+       status: finalStatus
+    }]);
+    
+    setIsSavingBatch(false);
+    
+    if (error) {
+       console.warn("Supabase insert error:", error);
+       alert("Erro ao salvar lote no histórico: " + error.message);
+    } else {
+       setIsBatchSaved(true);
+    }
+  };
+
+  const handleReprocess = async () => {
+    if (!selectedItem || !jobId || !reprocessPrompt) return;
+    
+    setIsReprocessing(true);
+    const formData = new FormData();
+    formData.append("prompt", reprocessPrompt);
+    formData.append("edit_type", editType);
+    formData.append("strength", reprocessStrength.toString());
+    formData.append("model", model);
+
+    try {
+      const authHeaders = await getAuthHeaders();
+      await fetch(`${API_URL}/jobs/${jobId}/reprocess/${selectedItem.id}`, {
+        method: "POST",
+        headers: authHeaders,
+        body: formData,
+      });
+      // Will naturally update via polling interval!
+    } catch (err) {
+      alert("Error triggering reprocess.");
+      setIsReprocessing(false);
+    }
+  };
+
+  const handleDownloadZip = async () => {
+    if (!jobId) return;
+    const authHeaders = await getAuthHeaders();
+    const res = await fetch(`${API_URL}/jobs/${jobId}/download`, { headers: authHeaders });
+    if (!res.ok) { alert("Erro ao baixar ZIP"); return; }
+    const blob = await res.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `bananabatch_${jobId}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
+
+  const openItemModal = (item: any) => {
+    setSelectedItem(item);
+    setReprocessPrompt(prompt); // load original prompt as suggestion
+    setReprocessStrength(strength);
+  };
+
+  const downloadSingleImage = async (url: string, filename: string, adj?: { brightness: number, contrast: number, saturate: number, points?: {x:number, y:number}[] }) => {
+    try {
+      const authHeaders = await getAuthHeaders();
+      const response = await fetch(url, { headers: authHeaders });
+      const blob = await response.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      
+      const hasCurves = adj?.points && adj.points.length >= 2;
+      
+      if (!adj || (adj.brightness === 100 && adj.contrast === 100 && adj.saturate === 100 && !hasCurves)) {
+         // Direct download
+         const a = document.createElement("a");
+         a.href = blobUrl;
+         a.download = filename;
+         document.body.appendChild(a);
+         a.click();
+         document.body.removeChild(a);
+         URL.revokeObjectURL(blobUrl);
+         return;
+      }
+      
+      // Canvas logic for customized adjustments
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.src = blobUrl;
+      
+      await new Promise((resolve) => {
+         img.onload = resolve;
+      });
+      
+      const canvas = document.createElement("canvas");
+      canvas.width = img.width;
+      canvas.height = img.height;
+      
+      const ctx = canvas.getContext("2d");
+      if (ctx) {
+         ctx.filter = `brightness(${adj.brightness}%) contrast(${adj.contrast}%) saturate(${adj.saturate}%)`;
+         ctx.drawImage(img, 0, 0);
+         
+         if (hasCurves) {
+             const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+             const lut = computeSplineLUT(adj.points!);
+             applyLUT(imgData, lut);
+             ctx.putImageData(imgData, 0, 0);
+         }
+         
+         canvas.toBlob(async (bl) => {
+            if (!bl) return;
+            
+            // Inject 300 DPI into JFIF header of the final output JPG
+            const buffer = await bl.arrayBuffer();
+            const dv = new DataView(buffer);
+            let offset = 0;
+            if (dv.getUint16(offset) === 0xffd8) { // Is JPEG?
+                offset += 2;
+                while (offset < dv.byteLength) {
+                    const marker = dv.getUint16(offset);
+                    const len = dv.getUint16(offset + 2);
+                    if (marker === 0xffe0) { // APP0 JFIF
+                        if (dv.getUint32(offset + 4) === 0x4a464946) {
+                            dv.setUint8(offset + 11, 1); // 1 = dots per inch
+                            dv.setUint16(offset + 12, 300); // X density
+                            dv.setUint16(offset + 14, 300); // Y density
+                            break;
+                        }
+                    }
+                    offset += 2 + len;
+                }
+            }
+            
+            const highDpiBlob = new Blob([buffer], { type: "image/jpeg" });
+            const newBlobUrl = URL.createObjectURL(highDpiBlob);
+            const a = document.createElement("a");
+            a.href = newBlobUrl;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(newBlobUrl);
+            URL.revokeObjectURL(blobUrl);
+         }, "image/jpeg", 1.0);
+      }
+    } catch (error) {
+       console.error("Error downloading image:", error);
+    }
+  };
+
+  return (
+    <div className="flex h-screen w-full bg-slate-50 text-slate-800 font-sans overflow-hidden">
+      
+      {/* Sidebar - Google Cloud Style */}
+      <aside className={`bg-white border-r border-slate-200 flex flex-col z-10 shadow-elevation-1 transition-all duration-300 ${isSidebarOpen ? 'w-80' : 'w-0 overflow-hidden border-none'}`}>
+        <div className="h-16 flex items-center px-4 border-b border-slate-200 shrink-0 w-80 gap-3">
+          <Link to="/" className="p-2 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-full transition-colors flex-shrink-0" title="Voltar ao Dashboard">
+             <ArrowLeft className="w-5 h-5" />
+          </Link>
+          <div className="flex items-center gap-2 text-primary">
+            <Sparkles className="h-5 w-5" />
+            <h1 className="text-sm font-bold text-slate-900 tracking-tight whitespace-nowrap">BananaBatch Editor</h1>
+          </div>
+        </div>
+        
+        <div className="flex-1 overflow-y-auto p-6 space-y-8 w-80">
+          
+          <div className="space-y-4">
+            <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider flex items-center gap-2">
+              <Settings className="w-4 h-4" /> Presets e Configuração
+            </h2>
+
+            <div className="space-y-2 pb-4 border-b border-slate-100">
+              <label className="text-sm font-medium text-slate-700">Carregar Preset Salvo</label>
+              <select 
+                onChange={(e) => loadPreset(e.target.value)}
+                className="w-full bg-slate-50 border border-slate-200 rounded text-sm p-2 outline-none focus:border-primary focus:ring-1 focus:ring-primary/20 transition-all font-medium"
+              >
+                <option value="">-- Selecione ou Manual --</option>
+                {presets.map((p) => (
+                  <option key={p.id} value={p.id}>{p.name}</option>
+                ))}
+              </select>
+            </div>
+            
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-slate-700">Modelo</label>
+              <select 
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                className="w-full bg-slate-50 border border-slate-200 rounded text-sm p-2 outline-none focus:border-primary focus:ring-1 focus:ring-primary/20 transition-all"
+              >
+                <option value="gemini-3.1-flash-image-preview">Gemini 3.1 Flash Image (Preview)</option>
+                <option value="gemini-3-pro-image-preview">Gemini 3 Pro Image (Preview)</option>
+              </select>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-slate-700">Tipo (Variância)</label>
+              <select 
+                value={editType}
+                onChange={(e) => setEditType(e.target.value)}
+                className="w-full bg-slate-50 border border-slate-200 rounded text-sm p-2 outline-none focus:border-primary focus:ring-1 focus:ring-primary/20 transition-all"
+              >
+                <option value="transform">Transformação (Geral)</option>
+                <option value="masking">Masking</option>
+                <option value="inpainting">Inpainting</option>
+              </select>
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex justify-between">
+                <label className="text-sm font-medium text-slate-700">Variação da Edição</label>
+                <span className="text-xs font-semibold text-primary">{Math.round(strength * 100)}%</span>
+              </div>
+              <input 
+                type="range" 
+                min="0.0" max="1.0" step="0.05"
+                value={strength}
+                onChange={(e) => setStrength(parseFloat(e.target.value))}
+                className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-primary"
+              />
+            </div>
+          </div>
+
+          <div className="space-y-4">
+            <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider flex items-center gap-2">
+              Prompt
+            </h2>
+            <textarea
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              placeholder="Ex: Altere o fundo para uma paisagem cyberpunk..."
+              className="w-full h-32 bg-slate-50 border border-slate-200 rounded p-3 text-sm resize-none outline-none focus:border-primary focus:ring-1 focus:ring-primary/20 transition-all"
+            />
+          </div>
+
+          <div className="pt-2 border-t border-slate-100 flex gap-2">
+             <input type="text" placeholder="Nome do Preset" value={newPresetName} onChange={e => setNewPresetName(e.target.value)} className="w-[60%] bg-white border border-slate-200 rounded text-xs p-2 outline-none" />
+             <button onClick={savePreset} disabled={!newPresetName} className="flex-1 bg-slate-200 text-slate-700 disabled:opacity-50 text-xs rounded font-medium hover:bg-slate-300 transition-colors">Salvar Preset</button>
+          </div>
+
+          <button
+            onClick={handleProcess}
+            disabled={isProcessing || files.length === 0 || !prompt}
+            className="w-full py-3 mt-4 px-4 bg-green-600 text-white rounded-lg text-sm font-bold shadow-lg shadow-green-600/20 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all transform hover:-translate-y-0.5 active:translate-y-0"
+          >
+            {isProcessing ? "Renderizando Imagens..." : `Processar ${files.length} imagens`}
+          </button>
+        </div>
+      </aside>
+
+      {/* Main Container */}
+      <main className="flex-1 flex flex-col relative overflow-hidden bg-slate-50/50">
+        <header className="h-16 bg-white border-b border-slate-200 flex items-center px-4 shrink-0 z-0 justify-between">
+          <div className="flex items-center gap-4">
+            <button 
+                onClick={() => setIsSidebarOpen(!isSidebarOpen)} 
+                className="p-2 hover:bg-slate-100 rounded-full transition-colors"
+                title="Toggle Sidebar"
+            >
+                {isSidebarOpen ? <ChevronLeft className="w-5 h-5 text-slate-600"/> : <ChevronRight className="w-5 h-5 text-slate-600"/>}
+            </button>
+            <div className="text-sm text-slate-500 flex items-center gap-2">
+              Workspace / <span className="font-semibold text-slate-800">Processamento em Massa</span>
+              
+              {jobStatus && jobStatus.status !== "processing" && jobStatus.total_time && (
+                 <div className="ml-4 flex items-center gap-3 border-l border-slate-200 pl-4">
+                    <span className="bg-slate-100 text-slate-600 px-2 py-1 rounded text-xs font-medium border border-slate-200">
+                      ⏱ Tempo Total: {jobStatus.total_time.toFixed(1)}s
+                    </span>
+                    <span className="bg-green-50 text-green-700 px-2 py-1 rounded text-xs font-medium border border-green-200">
+                      💰 Custo Processamento: ${(jobStatus.total_cost || 0).toFixed(4)}
+                    </span>
+                 </div>
+              )}
+            </div>
+          </div>
+
+          {jobStatus && jobStatus.status !== "processing" && (
+            <div className="flex items-center gap-3">
+              <button 
+                onClick={() => {
+                  setJobId(null);
+                  setJobStatus(null);
+                  setFiles([]);
+                  setIsSidebarOpen(true);
+                  setIsBatchSaved(false);
+                  setSearchParams({});
+                }}
+                className="flex items-center gap-2 px-4 py-2 bg-transparent text-slate-500 text-sm font-medium rounded hover:bg-slate-100 transition-colors mr-2"
+              >
+                <Plus className="w-4 h-4" /> Novo Lote
+              </button>
+              <button 
+                onClick={handleSaveBatch}
+                disabled={isBatchSaved || isSavingBatch}
+                className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-300 text-slate-700 text-sm font-medium rounded hover:bg-slate-50 shadow-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Save className="w-4 h-4 text-slate-500" /> {isBatchSaved ? "Lote Salvo!" : isSavingBatch ? "Salvando..." : "Salvar Lote"}
+              </button>
+              <button 
+                onClick={handleDownloadZip}
+                className="flex items-center gap-2 px-4 py-2 bg-slate-800 text-white text-sm font-medium rounded hover:bg-slate-900 shadow-sm transition-colors"
+              >
+                <Archive className="w-4 h-4"/> Baixar Tudo (.zip)
+              </button>
+            </div>
+          )}
+        </header>
+
+        <div className="flex-1 overflow-y-auto p-8">
+          <div className="max-w-6xl mx-auto space-y-8">
+            
+            {!jobStatus ? (
+              // Upload Area Active
+              <div 
+                onDragOver={handleDragOver}
+                onDrop={handleDrop}
+                onClick={() => fileInputRef.current?.click()}
+                className="border-2 border-dashed border-slate-300 bg-white rounded-xl p-12 flex flex-col items-center justify-center text-center cursor-pointer hover:border-primary hover:bg-slate-50 transition-all group"
+              >
+                <div className="h-16 w-16 bg-slate-100 text-slate-400 rounded-full flex items-center justify-center group-hover:bg-primary/10 group-hover:text-primary transition-all mb-4">
+                  <UploadCloud className="w-8 h-8" />
+                </div>
+                <h3 className="text-lg font-medium text-slate-800 mb-1">Arraste ou Clique para inserir arquivos</h3>
+                <p className="text-sm text-slate-500">Imagens JPG, PNG e WEBP suportadas</p>
+                <input 
+                  type="file" 
+                  multiple 
+                  className="hidden" 
+                  ref={fileInputRef} 
+                  onChange={(e) => e.target.files && handleFiles(e.target.files)} 
+                />
+              </div>
+            ) : null}
+
+            {files.length > 0 && !jobStatus && (
+              <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm">
+                <h3 className="text-sm font-semibold text-slate-800 mb-4 flex items-center gap-2">
+                  <ImageIcon className="w-4 h-4 text-slate-400" /> 
+                  Fila de Arquivos ({files.length})
+                </h3>
+                <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
+                  {files.map((file, i) => (
+                    <div key={i} className="flex items-center gap-3 p-3 border border-slate-100 rounded-lg bg-slate-50">
+                      <div className="w-8 h-8 bg-slate-200 rounded shrink-0 flex items-center justify-center text-xs font-medium text-slate-500 uppercase overflow-hidden">
+                        {file.name.split('.').pop()?.substring(0,3)}
+                      </div>
+                      <span className="text-xs font-medium truncate" title={file.name}>{file.name}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Results Grid */}
+            {jobStatus && (
+              <div className="space-y-6">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-xl font-semibold tracking-tight text-slate-800">Resultados da Edição</h2>
+                  {jobStatus.status === "processing" ? (
+                    <div className="flex items-center gap-2 text-sm text-primary font-medium bg-primary/10 px-3 py-1.5 rounded-full">
+                      <RefreshCw className="w-4 h-4 animate-spin" /> Em Processamento...
+                    </div>
+                  ) : null}
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+                  {jobStatus.items.map((item: any) => (
+                    <div key={item.id} className="bg-white border text-sm font-normal border-slate-200 rounded-xl overflow-hidden shadow-elevation-1 flex flex-col group p-1 transition-all hover:border-primary/50 hover:shadow-elevation-2">
+                      
+                      <div className="p-3 border-b border-slate-100 flex items-center justify-between bg-white">
+                        <span className="font-medium text-slate-700 truncate mr-4 text-xs" title={item.filename}>{item.filename}</span>
+                        {item.status === "processing" ? (
+                          <RefreshCw className="w-4 h-4 text-slate-400 animate-spin shrink-0" />
+                        ) : item.status === "ok" ? (
+                          <CheckCircle2 className="w-4 h-4 text-green-500 shrink-0" />
+                        ) : (
+                          <AlertCircle className="w-4 h-4 text-red-500 shrink-0" />
+                        )}
+                      </div>
+
+                      <div 
+                         className="aspect-square bg-slate-100 flex items-center justify-center relative overflow-hidden cursor-pointer"
+                         onClick={() => openItemModal(item)}
+                      >
+                        {item.status === "ok" && item.output_url ? (
+                          <img src={`${API_URL.replace('/api','')}${item.output_url}`} className="object-cover w-full h-full transform group-hover:scale-105 transition-transform duration-500" alt="Resultado" />
+                        ) : item.status === "processing" ? (
+                          <div className="flex flex-col items-center justify-center p-3 text-center w-full">
+                              <RefreshCw className="w-5 h-5 text-primary animate-spin mb-3 shadow-none" />
+                              <div className="text-[11px] font-medium text-slate-500 px-2 break-words w-full text-center">
+                                 {item.sub_status || "Iniciando processo..."}
+                              </div>
+                          </div>
+                        ) : item.status === "error" ? (
+                          <div className="p-4 text-xs text-red-500 text-center">{item.error_msg}</div>
+                        ) : null}
+
+                        {/* Hover Overlay */}
+                        {item.status !== "processing" && (
+                           <div className="absolute inset-0 bg-slate-900/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                              <div className="bg-white/90 backdrop-blur text-slate-800 rounded-full p-3 shadow-lg transform translate-y-4 group-hover:translate-y-0 transition-all duration-300">
+                                 <Maximize2 className="w-5 h-5"/>
+                              </div>
+                           </div>
+                        )}
+                      </div>
+                      
+                      {/* Cost and Time Metadata below image */}
+                      {item.status === "ok" && (
+                         <div className="p-2 bg-slate-50 border-t border-slate-100 flex items-center justify-between text-[11px] font-medium text-slate-500">
+                            <div>⏱ {item.processing_time?.toFixed(1) || "0.0"}s</div>
+                            <div>${item.estimated_cost?.toFixed(3) || "0.00"}</div>
+                         </div>
+                      )}
+                      
+                      {item.status === "ok" && (
+                         <div className="p-2 opacity-0 group-hover:opacity-100 transition-opacity absolute bottom-12 right-3 z-10">
+                           <button 
+                             onClick={(e) => {
+                                e.stopPropagation();
+                                const url = `${API_URL.replace('/api','')}${item.output_url}`;
+                                const filename = item.output_url.split('/').pop() || 'image.jpg';
+                                downloadSingleImage(url, filename);
+                             }}
+                             className="h-8 w-8 bg-white text-slate-700 rounded-full flex items-center justify-center hover:bg-primary hover:text-white shadow hover:border-transparent transition-all"
+                           >
+                             <Download className="w-4 h-4" />
+                           </button>
+                         </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+
+                {jobStatus.status !== "processing" && (
+                  <div className="flex justify-center pt-8">
+                     <button 
+                       onClick={() => {
+                         setJobId(null);
+                         setJobStatus(null);
+                         setFiles([]);
+                         setIsSidebarOpen(true);
+                         setIsBatchSaved(false);
+                         setSearchParams({});
+                       }}
+                       className="px-6 py-2.5 bg-white border border-slate-300 text-slate-700 font-medium rounded shadow-sm hover:bg-slate-50 transition-colors"
+                     >
+                       Novo Lote
+                     </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+          </div>
+        </div>
+      </main>
+
+      {/* Modal / Lightbox */}
+      {selectedItem && (
+         <div className="fixed inset-0 z-50 bg-slate-900/80 backdrop-blur-sm flex items-center justify-center p-4 lg:p-12">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-6xl max-h-full flex flex-col md:flex-row overflow-hidden relative">
+               
+               <button onClick={() => setSelectedItem(null)} className="absolute top-4 right-4 z-10 p-2 bg-black/10 hover:bg-black/20 text-white rounded-full transition-colors backdrop-blur">
+                  <X className="w-5 h-5" />
+               </button>
+
+               {/* Left: Image Display */}
+               <div className="flex-1 bg-slate-100 relative min-h-[300px] min-w-0 flex items-center justify-center p-4">
+                   {selectedItem.status === "ok" && selectedItem.output_url ? (
+                      <ImagePreviewNode 
+                           url={`${API_URL.replace('/api','')}${selectedItem.output_url}`}
+                           adj={adjustments[selectedItem.id]}
+                           onHistogramUpdate={(hist: number[]) => {
+                               setAdjustments(prev => {
+                                   const cur = prev[selectedItem.id];
+                                   // Only update if array is actually different to avoid render loops, although ImagePreviewNode already decouples
+                                   if (cur?.histogram && cur.histogram.length > 0) return prev; 
+                                   return {
+                                       ...prev,
+                                       [selectedItem.id]: {
+                                           ...(cur || {brightness: 100, contrast: 100, saturate: 100, points: [{x:0,y:0}, {x:255,y:255}]}),
+                                           histogram: hist
+                                       }
+                                   };
+                               });
+                           }}
+                      />
+                   ) : selectedItem.status === "processing" ? (
+                      <div className="flex flex-col items-center text-slate-500 max-w-sm text-center">
+                         <RefreshCw className="w-8 h-8 animate-spin mb-4 text-primary" />
+                         <span className="font-medium text-sm">{selectedItem.sub_status || "Processando arquivo..."}</span>
+                      </div>
+                   ) : (
+                      <div className="p-8 text-center text-red-500 max-w-md">
+                         <AlertCircle className="w-8 h-8 mx-auto mb-4" />
+                         <span className="font-medium">{selectedItem.error_msg}</span>
+                      </div>
+                   )}
+               </div>
+
+               {/* Right: Tools & Reprocess */}
+               <div className="w-full md:w-[450px] bg-white p-6 md:p-8 flex flex-col border-l border-slate-100 overflow-y-auto shrink-0">
+                  <div className="mb-6">
+                     <h3 className="text-lg font-bold text-slate-800">Auditoria de Imagem</h3>
+                     <p className="text-sm text-slate-500 break-all">{selectedItem.filename}</p>
+                  </div>
+
+                  {selectedItem.status === "ok" && (
+                     <div className="flex items-center gap-2 mb-6 bg-green-50 text-green-700 px-4 py-3 rounded-lg border border-green-100">
+                        <CheckCircle2 className="w-5 h-5" />
+                        <span className="text-sm font-medium">Renderização aprovada</span>
+                     </div>
+                  )}
+
+                  <div className="space-y-6 flex-1">
+                     
+                     {/* Photoshop curves/lighting */}
+                     {selectedItem.status === "ok" && (
+                         <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-4">
+                             <h4 className="text-sm font-bold text-slate-700 flex flex-col gap-1">
+                                 Ajustes Rápidos (Lightroom)
+                                 <span className="text-[11px] font-normal text-slate-500">Baixa junto com a imagem</span>
+                             </h4>
+                             
+                             <div className="space-y-3">
+                                <div className="space-y-1">
+                                    <div className="flex justify-between text-[11px] font-medium text-slate-600">
+                                        <label>Brilho</label>
+                                        <span>{adjustments[selectedItem.id]?.brightness ?? 100}%</span>
+                                    </div>
+                                    <input 
+                                        type="range" min="50" max="150" step="1" 
+                                        value={adjustments[selectedItem.id]?.brightness ?? 100}
+                                        onChange={e => setAdjustments(prev => ({...prev, [selectedItem.id]: { ...(prev[selectedItem.id] || {contrast: 100, saturate: 100}), brightness: Number(e.target.value) }}))}
+                                        className="w-full h-1 bg-slate-200 rounded appearance-none accent-primary cursor-pointer"
+                                    />
+                                </div>
+                                <div className="space-y-1">
+                                    <div className="flex justify-between text-[11px] font-medium text-slate-600">
+                                        <label>Contraste</label>
+                                        <span>{adjustments[selectedItem.id]?.contrast ?? 100}%</span>
+                                    </div>
+                                    <input 
+                                        type="range" min="50" max="150" step="1" 
+                                        value={adjustments[selectedItem.id]?.contrast ?? 100}
+                                        onChange={e => setAdjustments(prev => ({...prev, [selectedItem.id]: { ...(prev[selectedItem.id] || {brightness: 100, saturate: 100}), contrast: Number(e.target.value) }}))}
+                                        className="w-full h-1 bg-slate-200 rounded appearance-none accent-primary cursor-pointer"
+                                    />
+                                </div>
+                                <div className="space-y-1">
+                                    <div className="flex justify-between text-[11px] font-medium text-slate-600">
+                                        <label>Saturação</label>
+                                        <span>{adjustments[selectedItem.id]?.saturate ?? 100}%</span>
+                                    </div>
+                                    <input 
+                                        type="range" min="0" max="200" step="1" 
+                                        value={adjustments[selectedItem.id]?.saturate ?? 100}
+                                        onChange={e => setAdjustments(prev => ({...prev, [selectedItem.id]: { ...(prev[selectedItem.id] || {brightness: 100, contrast: 100}), saturate: Number(e.target.value) }}))}
+                                        className="w-full h-1 bg-slate-200 rounded appearance-none accent-primary cursor-pointer"
+                                    />
+                                </div>
+                                <div className="space-y-1 pt-4">
+                                    <div className="flex justify-between text-[11px] font-medium text-slate-600 mb-2">
+                                        <label>Curvas (RGB)</label>
+                                    </div>
+                                    <CurvesEditor 
+                                        points={adjustments[selectedItem.id]?.points || [{x:0, y:0}, {x:255, y:255}]}
+                                        onChange={(newPts: {x:number, y:number}[]) => setAdjustments(prev => ({...prev, [selectedItem.id]: { ...(prev[selectedItem.id] || {brightness: 100, contrast: 100, saturate: 100}), points: newPts }}))}
+                                        histogram={adjustments[selectedItem.id]?.histogram}
+                                    />
+                                </div>
+                             </div>
+                         </div>
+                     )}
+
+                     <div className="space-y-2">
+                        <label className="text-sm font-semibold text-slate-700">Comentários (Novo Prompt)</label>
+                        <textarea 
+                           className="w-full h-24 bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm resize-none outline-none focus:border-primary focus:ring-1 transition-all"
+                           placeholder="Ex: Refazer este fundo deixando-o mais realista..."
+                           value={reprocessPrompt}
+                           onChange={e => setReprocessPrompt(e.target.value)}
+                        />
+                     </div>
+
+                     <div className="space-y-2">
+                        <div className="flex justify-between">
+                           <label className="text-sm font-semibold text-slate-700">Força da Variação</label>
+                           <span className="text-xs font-bold text-primary">{Math.round(reprocessStrength * 100)}%</span>
+                        </div>
+                        <input 
+                           type="range" 
+                           min="0.0" max="1.0" step="0.05"
+                           value={reprocessStrength}
+                           onChange={(e) => setReprocessStrength(parseFloat(e.target.value))}
+                           className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-primary"
+                        />
+                     </div>
+                  </div>
+
+                  <div className="pt-6 mt-6 border-t border-slate-100 flex gap-3">
+                     {selectedItem.status === "ok" && selectedItem.output_url && (
+                        <button 
+                           onClick={() => {
+                              const url = `${API_URL.replace('/api','')}${selectedItem.output_url}`;
+                              const filename = selectedItem.output_url.split('/').pop() || 'image.jpg';
+                              downloadSingleImage(url, filename, adjustments[selectedItem.id]);
+                           }}
+                           className="flex-1 py-3 px-4 bg-slate-100 text-slate-700 rounded-lg text-sm font-semibold hover:bg-slate-200 transition-colors flex items-center justify-center gap-2"
+                        >
+                           <Download className="w-4 h-4"/> Baixar
+                        </button>
+                     )}
+                     <button
+                        onClick={handleReprocess}
+                        disabled={isReprocessing || selectedItem.status === "processing"}
+                        className="flex-1 py-3 px-4 bg-primary text-white rounded-lg text-sm font-semibold shadow-lg shadow-primary/20 hover:bg-primary-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                     >
+                        {isReprocessing || selectedItem.status === "processing" ? "Processando..." : "Reprocessar"}
+                     </button>
+                  </div>
+               </div>
+            </div>
+         </div>
+      )}
+
+    </div>
+  );
+
+  function handleFiles(fileList: FileList) {
+    const validFiles = Array.from(fileList).filter((f) => f.type.startsWith("image/"));
+    setFiles((prev) => [...prev, ...validFiles]);
+  }
+}
