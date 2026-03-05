@@ -78,9 +78,11 @@ export default function BatchEditor() {
     const allItems = jobIds.flatMap(jid =>
       (jobStatuses[jid]?.items || []).map((item: any) => ({ ...item, _jobId: jid }))
     );
-    const anyProcessing = statuses.some((s: any) => s.status === "processing");
+    const anyActive = statuses.some((s: any) =>
+      s.status === "processing" || s.status === "collecting"
+    );
     return {
-      status: anyProcessing ? "processing" : "completed",
+      status: anyActive ? "processing" : "completed",
       items: allItems,
       total_cost: statuses.reduce((sum: number, s: any) => sum + (s.total_cost || 0), 0),
       total_time: statuses.reduce((sum: number, s: any) => sum + (s.total_time || 0), 0),
@@ -102,6 +104,8 @@ export default function BatchEditor() {
   const [isBatchSaved, setIsBatchSaved] = useState(false);
   const [isSavingBatch, setIsSavingBatch] = useState(false);
   const [isDownloadingZip, setIsDownloadingZip] = useState(false);
+  // Upload progress for the new per-file upload flow
+  const [uploadProgress, setUploadProgress] = useState<{ done: number; total: number } | null>(null);
   // Map of item.id -> authenticated blob URL for image display
   const [blobUrls, setBlobUrls] = useState<Record<string, string>>({});
 
@@ -220,8 +224,11 @@ export default function BatchEditor() {
       // Determine if all jobs finished
       const loaded = snapshots.filter(Boolean) as { jid: string; data: any }[];
       if (loaded.length < jobIds.length) return;
-      const anyProcessing = loaded.some(s => s.data.status === "processing" ||
-        s.data.items?.some((i: any) => i.status === "processing"));
+      const anyProcessing = loaded.some(s =>
+        s.data.status === "processing" ||
+        s.data.status === "collecting" ||
+        s.data.items?.some((i: any) => i.status === "processing" || i.status === "queued")
+      );
       if (!anyProcessing) {
         active = false;
         clearInterval(interval);
@@ -254,13 +261,7 @@ export default function BatchEditor() {
     if (!files.length || !prompt) return;
     setIsProcessing(true);
     setIsSidebarOpen(false);
-
-    // Split into chunks so even 30+ photos never hit upload size limits
-    const CHUNK_SIZE = 8;
-    const chunks: File[][] = [];
-    for (let i = 0; i < files.length; i += CHUNK_SIZE) {
-      chunks.push(files.slice(i, i + CHUNK_SIZE));
-    }
+    setUploadProgress({ done: 0, total: files.length });
 
     const finalPrompt = donts.trim()
       ? `${prompt}\n\nO que evitar (não deve ser feito em hipótese alguma): ${donts}`
@@ -272,54 +273,84 @@ export default function BatchEditor() {
     } catch {
       alert("Erro de conexão com o servidor. Verifique sua internet e tente novamente.");
       setIsProcessing(false);
+      setUploadProgress(null);
       return;
     }
 
-    // Submit all chunks in parallel
-    const results = await Promise.allSettled(
-      chunks.map(async (chunk) => {
-        const fd = new FormData();
-        chunk.forEach(f => fd.append("files", f));
-        fd.append("prompt", finalPrompt);
-        fd.append("edit_type", editType);
-        fd.append("strength", strength.toString());
-        fd.append("model", model);
+    // Step 1: Create an empty job shell
+    let newJobId: string;
+    try {
+      const initFd = new FormData();
+      initFd.append("total_files", files.length.toString());
+      initFd.append("prompt", finalPrompt);
+      initFd.append("edit_type", editType);
+      initFd.append("strength", strength.toString());
+      initFd.append("model", model);
 
-        const res = await fetch(`${API_URL}/jobs`, {
+      const res = await fetch(`${API_URL}/jobs/init`, {
+        method: "POST",
+        headers: authHeaders,
+        body: initFd,
+      });
+
+      if (!res.ok) {
+        let detail = "";
+        try { detail = (await res.json()).detail || ""; } catch {}
+        throw new Error(
+          (res.status === 401 || res.status === 403)
+            ? "Sessão inválida ou expirada. Por favor, faça login novamente."
+            : `Erro no servidor (${res.status}): ${detail || res.statusText}`
+        );
+      }
+
+      const data = await res.json();
+      newJobId = data.job_id as string;
+    } catch (err: any) {
+      alert(err.message || "Erro ao iniciar processamento.");
+      setIsProcessing(false);
+      setUploadProgress(null);
+      return;
+    }
+
+    // Step 2: Upload each file individually with concurrency limit of 5
+    // Each request is ~1 file (~30-50 MB max) — well within NPM's 100M limit
+    const CONCURRENCY = 5;
+    let doneCount = 0;
+    const queue = [...files];
+
+    const uploadOne = async (file: File): Promise<void> => {
+      const fd = new FormData();
+      fd.append("file", file);
+      try {
+        const res = await fetch(`${API_URL}/jobs/${newJobId}/upload`, {
           method: "POST",
           headers: authHeaders,
           body: fd,
         });
-
         if (!res.ok) {
           let detail = "";
           try { detail = (await res.json()).detail || ""; } catch {}
-          throw new Error(
-            (res.status === 401 || res.status === 403)
-              ? "Sessão inválida ou expirada. Por favor, faça login novamente."
-              : `Erro no servidor (${res.status}): ${detail || res.statusText}`
-          );
+          console.error(`Falha no upload de ${file.name}: ${detail}`);
         }
+      } catch (err) {
+        console.error(`Erro de rede ao enviar ${file.name}:`, err);
+      }
+      doneCount++;
+      setUploadProgress({ done: doneCount, total: files.length });
+    };
 
-        const data = await res.json();
-        return data.job_id as string;
-      })
-    );
+    // Run CONCURRENCY workers in parallel draining the queue
+    const workers = Array.from({ length: CONCURRENCY }, async () => {
+      while (queue.length > 0) {
+        const file = queue.shift();
+        if (file) await uploadOne(file);
+      }
+    });
+    await Promise.all(workers);
 
-    const newJobIds: string[] = [];
-    const errors: string[] = [];
-    for (const r of results) {
-      if (r.status === "fulfilled") newJobIds.push(r.value);
-      else errors.push((r as PromiseRejectedResult).reason?.message || "Erro desconhecido");
-    }
-
-    if (errors.length > 0) alert(errors[0]);
-
-    if (newJobIds.length > 0) {
-      setJobIds(newJobIds);
-    } else {
-      setIsProcessing(false);
-    }
+    // Step 3: All files uploaded — hand off to polling
+    setUploadProgress(null);
+    setJobIds([newJobId]);
   };
 
   const handleSaveBatch = async () => {
@@ -607,7 +638,7 @@ export default function BatchEditor() {
             disabled={isProcessing || files.length === 0 || !prompt}
             className="w-full py-3 mt-4 px-4 bg-green-600 text-white rounded-lg text-sm font-bold shadow-lg shadow-green-600/20 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all transform hover:-translate-y-0.5 active:translate-y-0"
           >
-            {isProcessing ? "Renderizando Imagens..." : `Processar ${files.length} imagens`}
+            {isProcessing ? (uploadProgress ? `Enviando ${uploadProgress.done}/${uploadProgress.total}...` : "Processando...") : `Processar ${files.length} imagens`}
           </button>
         </div>
       </aside>
@@ -641,10 +672,10 @@ export default function BatchEditor() {
 
           {jobStatus && jobStatus.status !== "processing" && (
             <div className="flex items-center gap-3">
-              <button 
+              <button
                 onClick={() => {
-                  setJobId(null);
-                  setJobStatus(null);
+                  setJobIds([]);
+                  setJobStatuses({});
                   setFiles([]);
                   setIsSidebarOpen(true);
                   setIsBatchSaved(false);
@@ -680,9 +711,31 @@ export default function BatchEditor() {
         <div className="flex-1 overflow-y-auto p-8">
           <div className="max-w-6xl mx-auto space-y-8">
             
-            {!jobStatus ? (
+            {/* Upload progress screen — shown while files are being sent one-by-one */}
+            {uploadProgress && (
+              <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-12 flex flex-col items-center justify-center text-center space-y-6">
+                <div className="h-16 w-16 bg-primary/10 text-primary rounded-full flex items-center justify-center">
+                  <UploadCloud className="w-8 h-8 animate-pulse" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-semibold text-slate-800 mb-1">Enviando imagens...</h3>
+                  <p className="text-sm text-slate-500">{uploadProgress.done} de {uploadProgress.total} arquivos enviados</p>
+                </div>
+                <div className="w-full max-w-md">
+                  <div className="w-full bg-slate-100 rounded-full h-2.5 overflow-hidden">
+                    <div
+                      className="bg-primary h-2.5 rounded-full transition-all duration-300"
+                      style={{ width: `${(uploadProgress.done / uploadProgress.total) * 100}%` }}
+                    />
+                  </div>
+                  <p className="text-xs text-slate-400 mt-2">{Math.round((uploadProgress.done / uploadProgress.total) * 100)}%</p>
+                </div>
+              </div>
+            )}
+
+            {!uploadProgress && !jobStatus ? (
               // Upload Area Active
-              <div 
+              <div
                 onDragOver={handleDragOver}
                 onDrop={handleDrop}
                 onClick={() => fileInputRef.current?.click()}
@@ -693,17 +746,17 @@ export default function BatchEditor() {
                 </div>
                 <h3 className="text-lg font-medium text-slate-800 mb-1">Arraste ou Clique para inserir arquivos</h3>
                 <p className="text-sm text-slate-500">Imagens JPG, PNG e WEBP suportadas</p>
-                <input 
-                  type="file" 
-                  multiple 
-                  className="hidden" 
-                  ref={fileInputRef} 
-                  onChange={(e) => e.target.files && handleFiles(e.target.files)} 
+                <input
+                  type="file"
+                  multiple
+                  className="hidden"
+                  ref={fileInputRef}
+                  onChange={(e) => e.target.files && handleFiles(e.target.files)}
                 />
               </div>
             ) : null}
 
-            {files.length > 0 && !jobStatus && (
+            {files.length > 0 && !jobStatus && !uploadProgress && (
               <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm">
                 <h3 className="text-sm font-semibold text-slate-800 mb-4 flex items-center gap-2">
                   <ImageIcon className="w-4 h-4 text-slate-400" /> 

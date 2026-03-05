@@ -188,6 +188,89 @@ async def process_job(job_id: str, prompt: str, edit_type: str, strength: float,
                 item["status"] = "error"
                 item["error_msg"] = f"Global error: {e}"
 
+@app.post("/api/jobs/init")
+async def init_job(
+    total_files: int = Form(...),
+    prompt: str = Form(...),
+    edit_type: str = Form("transform"),
+    strength: float = Form(0.75),
+    model: str = Form("gemini-3.1-flash-image-preview"),
+    user: dict = Depends(require_auth),
+):
+    """Create an empty job shell. Files are then uploaded one-by-one via /api/jobs/{job_id}/upload."""
+    job_id = str(uuid.uuid4())
+    temp_dir = Path(tempfile.mkdtemp(prefix=f"banana_{job_id}"))
+    JBS[job_id] = {
+        "job_id": job_id,
+        "status": "collecting",
+        "items": [],
+        "total_cost": 0.0,
+        "temp_dir": temp_dir,   # kept for compatibility with reprocess_item
+        "_file_paths": {},
+        "_prompt": prompt,
+        "_edit_type": edit_type,
+        "_strength": float(strength),
+        "_model": model,
+        "_total_files": int(total_files),
+        "owner_id": user["id"],
+    }
+    print(f"\n\033[96m📂 NOVO JOB INIT [{job_id[:8]}] aguardando {total_files} arquivo(s)\033[0m")
+    return {"job_id": job_id, "status": "collecting"}
+
+
+@app.post("/api/jobs/{job_id}/upload")
+async def upload_file_to_job(
+    job_id: str,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    user: dict = Depends(require_auth),
+):
+    """Upload a single file to an existing job. Processing starts when all files are received."""
+    if job_id not in JBS:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = JBS[job_id]
+    if job.get("owner_id") and job["owner_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+    if job["status"] != "collecting":
+        raise HTTPException(status_code=400, detail="Job is not in collecting state")
+
+    temp_dir: Path = job["temp_dir"]
+    safe_filename = Path(file.filename or "upload").name  # strip any path traversal
+    file_path = temp_dir / safe_filename
+    with open(file_path, "wb") as out:
+        shutil.copyfileobj(file.file, out)
+
+    item_id = str(uuid.uuid4())
+    job["_file_paths"][safe_filename] = file_path
+    job["items"].append({
+        "id": item_id,
+        "filename": safe_filename,
+        "status": "queued",
+    })
+
+    received = len(job["items"])
+    total = job["_total_files"]
+    print(f"\033[96m📥 [{job_id[:8]}] {safe_filename} recebido ({received}/{total})\033[0m")
+
+    if received >= total:
+        # All files received — kick off processing
+        for item in job["items"]:
+            item["status"] = "processing"
+        job["status"] = "processing"
+        background_tasks.add_task(
+            process_job,
+            job_id,
+            job["_prompt"],
+            job["_edit_type"],
+            job["_strength"],
+            job["_model"],
+            dict(job["_file_paths"]),
+            temp_dir,
+        )
+
+    return {"item_id": item_id, "received": received, "total": total, "status": job["status"]}
+
+
 @app.post("/api/jobs")
 async def create_job(
     background_tasks: BackgroundTasks,
@@ -309,7 +392,8 @@ async def reprocess_item(
         raise HTTPException(status_code=404, detail="Item not found")
         
     # Determine base image for reprocessing (use latest generated image if available)
-    base_file_path = job["temp_dir"] / item["filename"]
+    temp_dir_val = job.get("temp_dir")
+    base_file_path = Path(temp_dir_val) / item["filename"]
     if item.get("output_url"):
         # Extract filename from url: /api/jobs/{job_id}/files/{filename}
         out_filename = Path(item["output_url"]).name
