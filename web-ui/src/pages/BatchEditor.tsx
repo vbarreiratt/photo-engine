@@ -111,9 +111,19 @@ export default function BatchEditor() {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Helper: get Supabase JWT to send as Bearer token to the backend
+  // Helper: get Supabase JWT to send as Bearer token to the backend.
+  // Falls back to an explicit refreshSession() call when the cached session
+  // has an expired access_token (e.g. after processing a large batch > 1 h).
   const getAuthHeaders = async (): Promise<Record<string, string>> => {
-    const { data: { session } } = await supabase.auth.getSession();
+    let { data: { session } } = await supabase.auth.getSession();
+    // If the access token is missing or clearly expired, request a fresh one.
+    const expiredOrMissing =
+      !session?.access_token ||
+      (session.expires_at && session.expires_at * 1000 < Date.now() + 30_000);
+    if (expiredOrMissing) {
+      const { data } = await supabase.auth.refreshSession();
+      session = data.session;
+    }
     const token = session?.access_token;
     return token ? { Authorization: `Bearer ${token}` } : {};
   };
@@ -192,8 +202,13 @@ export default function BatchEditor() {
       const snapshots = await Promise.all(
         jobIds.map(jid =>
           fetch(`${API_URL}/jobs/${jid}`, { headers })
-            .then(r => r.json())
-            .then(data => ({ jid, data }))
+            .then(async r => {
+              // Treat any HTTP error (401, 403, 5xx) as "no data" so polling
+              // continues instead of mis-detecting the job as completed.
+              if (!r.ok) return null;
+              const data = await r.json();
+              return { jid, data };
+            })
             .catch(() => null)
         )
       );
@@ -411,17 +426,30 @@ export default function BatchEditor() {
     setIsDownloadingZip(true);
     try {
       const authHeaders = await getAuthHeaders();
+      // If session is fully expired even after refresh, bail out clearly.
+      if (!authHeaders.Authorization) {
+        alert("Sessão expirada. Por favor, faça login novamente e tente baixar novamente.");
+        return;
+      }
+      const dateStr = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
       const usePartSuffix = jobIds.length > 1;
       for (let i = 0; i < jobIds.length; i++) {
         const jid = jobIds[i];
         const res = await fetch(`${API_URL}/jobs/${jid}/download`, { headers: authHeaders });
-        if (!res.ok) { alert(`Erro ao baixar ZIP (parte ${i + 1})`); continue; }
+        if (res.status === 401 || res.status === 403) {
+          alert("Sessão expirada. Por favor, faça login novamente e tente baixar novamente.");
+          break; // Stop the loop — all subsequent requests will also fail
+        }
+        if (!res.ok) {
+          alert(`Erro ao baixar ZIP${usePartSuffix ? ` (parte ${i + 1})` : ""}: ${res.statusText}`);
+          continue;
+        }
         const blob = await res.blob();
         const a = document.createElement("a");
         a.href = URL.createObjectURL(blob);
         a.download = usePartSuffix
-          ? `bananabatch_parte${i + 1}.zip`
-          : `bananabatch_${jid}.zip`;
+          ? `bananabatch_parte${i + 1}_${dateStr}.zip`
+          : `bananabatch_${dateStr}.zip`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
