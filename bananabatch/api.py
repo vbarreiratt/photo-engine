@@ -10,7 +10,7 @@ from typing import Dict, List, Optional
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 import io
@@ -336,13 +336,14 @@ async def get_file(job_id: str, filename: str, user: dict = Depends(require_auth
     file_path = Path("outputs") / job_id / safe_filename
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
-    
-    return FileResponse(
-        file_path,
-        headers={
-            "Cache-Control": "no-store",  # never cache sensitive images
-            "X-Content-Type-Options": "nosniff",
-        }
+
+    # Delegate file serving to nginx via X-Accel-Redirect.
+    # Auth is still enforced here; nginx reads the file directly from disk
+    # without going through the Python worker, freeing it for AI processing.
+    return Response(
+        content=b"",
+        status_code=200,
+        headers={"X-Accel-Redirect": f"/internal-outputs/{job_id}/{safe_filename}"},
     )
 
 @app.get("/api/jobs/{job_id}/download")
