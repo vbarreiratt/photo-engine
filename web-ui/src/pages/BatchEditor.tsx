@@ -110,6 +110,10 @@ export default function BatchEditor() {
   const [blobUrls, setBlobUrls] = useState<Record<string, string>>({});
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // Tracks item IDs for which a blob-URL fetch has already been started.
+  // Using a ref (not state) so the polling setInterval always sees the latest
+  // value without needing to be in the effect's dependency array.
+  const fetchingBlobIds = useRef<Set<string>>(new Set());
 
   // Helper: get Supabase JWT to send as Bearer token to the backend.
   // Falls back to an explicit refreshSession() call when the cached session
@@ -224,11 +228,15 @@ export default function BatchEditor() {
         return next;
       });
 
-      // Pre-fetch blob URLs for newly completed items across all chunks
+      // Pre-fetch blob URLs for newly completed items across all chunks.
+      // Use fetchingBlobIds ref (not the blobUrls state) to avoid a stale
+      // closure where the setInterval always saw blobUrls = {} and re-fetched
+      // every image on every tick, causing huge repeated traffic.
       for (const snap of snapshots) {
         if (!snap?.data?.items) continue;
         for (const item of snap.data.items) {
-          if (item.status === "ok" && item.output_url && !blobUrls[item.id]) {
+          if (item.status === "ok" && item.output_url && !fetchingBlobIds.current.has(item.id)) {
+            fetchingBlobIds.current.add(item.id);
             fetchBlobUrl(item.output_url).then(blobUrl => {
               if (blobUrl) setBlobUrls(prev => ({ ...prev, [item.id]: blobUrl }));
             });
@@ -365,6 +373,7 @@ export default function BatchEditor() {
 
     // Step 3: All files uploaded — hand off to polling
     setUploadProgress(null);
+    fetchingBlobIds.current = new Set(); // reset for this new batch
     setJobIds([newJobId]);
   };
 
@@ -702,6 +711,7 @@ export default function BatchEditor() {
             <div className="flex items-center gap-3">
               <button
                 onClick={() => {
+                  fetchingBlobIds.current = new Set();
                   setJobIds([]);
                   setJobStatuses({});
                   setFiles([]);
@@ -892,6 +902,7 @@ export default function BatchEditor() {
                   <div className="flex justify-center pt-8">
                      <button 
                        onClick={() => {
+                         fetchingBlobIds.current = new Set();
                          setJobIds([]);
                          setJobStatuses({});
                          setFiles([]);
