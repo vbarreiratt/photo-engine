@@ -1,0 +1,76 @@
+# Local development stack for BananaBatch v2
+#
+# Usage:
+#   1. Copy .env.local.example to .env.local and fill in your keys
+#   2. docker compose -f docker-compose.local.yml --env-file .env.local up --build
+#   3. Open http://localhost:5173  (Vite dev server with HMR)
+#      Backend API is at http://localhost:8000/api
+#
+# The frontend Vite dev server proxies /api → http://backend:8000 automatically
+# via the vite.config.ts proxy setting (add it if not yet present).
+#
+# Data persists across restarts in named volumes:
+#   backend-outputs-local  — processed images
+#   backend-state-local    — SQLite database
+
+services:
+
+  backend:
+    image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      # Mount source so --reload picks up every file change without rebuild
+      - ./:/app
+      - backend-outputs-local:/app/outputs-vol
+      - backend-state-local:/app/data
+    environment:
+      GEMINI_API_KEY: "${GEMINI_API_KEY}"
+      SUPABASE_ANON_KEY: "${SUPABASE_ANON_KEY}"
+      SUPABASE_PROJECT_ID: "${SUPABASE_PROJECT_ID}"
+      SUPABASE_API_URL: "${SUPABASE_API_URL}"
+      ALLOWED_ORIGIN: "http://localhost:5173"
+      DB_DIR: "/app/data"
+      OUTPUT_DIR: "/app/outputs-vol"
+    command:
+      - sh
+      - -c
+      - |
+        pip install --quiet --no-cache-dir \
+          fastapi uvicorn python-multipart httpx python-dotenv \
+          google-genai aiofiles pydantic aiosqlite Pillow jinja2
+        pip install --quiet --no-cache-dir -e .
+        exec uvicorn bananabatch.api:app \
+          --host 0.0.0.0 --port 8000 \
+          --reload --reload-dir /app/bananabatch
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./web-ui:/app
+      # Isolate node_modules inside the container
+      - frontend-node-modules:/app/node_modules
+    environment:
+      VITE_SUPABASE_URL: "${VITE_SUPABASE_URL}"
+      VITE_SUPABASE_ANON_KEY: "${VITE_SUPABASE_ANON_KEY}"
+      # Point to the local backend (Vite proxy handles /api → backend:8000)
+      VITE_API_URL: ""
+    command:
+      - sh
+      - -c
+      - |
+        npm install
+        exec npm run dev -- --host 0.0.0.0 --port 5173
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  backend-outputs-local:
+  backend-state-local:
+  frontend-node-modules:

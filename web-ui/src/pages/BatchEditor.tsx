@@ -111,9 +111,9 @@ export default function BatchEditor() {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Tracks item IDs for which a blob-URL fetch has already been started.
-  // Using a ref (not state) so the polling setInterval always sees the latest
-  // value without needing to be in the effect's dependency array.
   const fetchingBlobIds = useRef<Set<string>>(new Set());
+  // Increment to force SSE reconnect (e.g. after reprocess triggers a new job run)
+  const [sseKey, setSseKey] = useState(0);
 
   // Helper: get Supabase JWT to send as Bearer token to the backend.
   // Falls back to an explicit refreshSession() call when the cached session
@@ -194,84 +194,104 @@ export default function BatchEditor() {
     return URL.createObjectURL(blob);
   };
 
-  // Poll all active job chunks every 2 seconds
+  // Real-time job updates via Server-Sent Events.
+  // sseKey forces a reconnect when reprocess restarts a completed job.
   useEffect(() => {
     if (jobIds.length === 0) return;
 
     let active = true;
-    const interval = setInterval(async () => {
-      if (!active) return;
-      const headers = await getAuthHeaders();
+    const sources: EventSource[] = [];
+    // Keep a ref-stable copy of selectedItem for use inside event handlers
+    let latestSelectedItem = selectedItem;
 
-      const snapshots = await Promise.all(
-        jobIds.map(jid =>
-          fetch(`${API_URL}/jobs/${jid}`, { headers })
-            .then(async r => {
-              // Treat any HTTP error (401, 403, 5xx) as "no data" so polling
-              // continues instead of mis-detecting the job as completed.
-              if (!r.ok) return null;
-              const data = await r.json();
-              return { jid, data };
-            })
-            .catch(() => null)
-        )
-      );
-
-      if (!active) return;
-
-      // Batch-update all statuses at once to avoid multiple re-renders
-      setJobStatuses(prev => {
-        const next = { ...prev };
-        for (const snap of snapshots) {
-          if (snap) next[snap.jid] = snap.data;
-        }
-        return next;
-      });
-
-      // Pre-fetch blob URLs for newly completed items across all chunks.
-      // Use fetchingBlobIds ref (not the blobUrls state) to avoid a stale
-      // closure where the setInterval always saw blobUrls = {} and re-fetched
-      // every image on every tick, causing huge repeated traffic.
-      for (const snap of snapshots) {
-        if (!snap?.data?.items) continue;
-        for (const item of snap.data.items) {
-          if (item.status === "ok" && item.output_url && !fetchingBlobIds.current.has(item.id)) {
-            fetchingBlobIds.current.add(item.id);
-            fetchBlobUrl(item.output_url).then(blobUrl => {
-              if (blobUrl) setBlobUrls(prev => ({ ...prev, [item.id]: blobUrl }));
-            });
-          }
-        }
+    const connectSSE = async (jid: string) => {
+      let token = "";
+      try {
+        const headers = await getAuthHeaders();
+        token = headers["Authorization"]?.replace("Bearer ", "") ?? "";
+      } catch {
+        return;
       }
+      if (!token || !active) return;
 
-      // Determine if all jobs finished
-      const loaded = snapshots.filter(Boolean) as { jid: string; data: any }[];
-      if (loaded.length < jobIds.length) return;
-      const anyProcessing = loaded.some(s =>
-        s.data.status === "processing" ||
-        s.data.status === "collecting" ||
-        s.data.items?.some((i: any) => i.status === "processing" || i.status === "queued")
+      const es = new EventSource(
+        `${API_URL}/jobs/${jid}/events?token=${encodeURIComponent(token)}`
       );
-      if (!anyProcessing) {
-        active = false;
-        clearInterval(interval);
+      sources.push(es);
+
+      es.onmessage = (e) => {
+        if (!active) return;
+        try {
+          const data = JSON.parse(e.data);
+          setJobStatuses((prev) => ({ ...prev, [jid]: data }));
+
+          // Pre-fetch blob URLs for newly completed items
+          for (const item of data.items ?? []) {
+            if (
+              item.status === "ok" &&
+              item.output_url &&
+              !fetchingBlobIds.current.has(item.id)
+            ) {
+              fetchingBlobIds.current.add(item.id);
+              fetchBlobUrl(item.output_url).then((blobUrl) => {
+                if (blobUrl) setBlobUrls((prev) => ({ ...prev, [item.id]: blobUrl }));
+              });
+            }
+          }
+        } catch {}
+      };
+
+      // "done" is a named event sent by the backend when the job finishes
+      es.addEventListener("done", () => {
+        if (!active) return;
+        es.close();
         setIsProcessing(false);
-        // Sync the modal item if it was being reprocessed
-        if (selectedItem) {
-          for (const { jid, data } of loaded) {
-            const updated = data.items?.find((i: any) => i.id === selectedItem.id);
+
+        // Sync the reprocess modal if it was waiting for this job
+        setJobStatuses((prev) => {
+          const job = prev[jid];
+          if (job && latestSelectedItem) {
+            const updated = job.items?.find((i: any) => i.id === latestSelectedItem.id);
             if (updated) {
               setIsReprocessing(false);
               setSelectedItem({ ...updated, _jobId: jid });
-              break;
             }
           }
-        }
-      }
-    }, 2000);
+          return prev;
+        });
+      });
 
-    return () => { active = false; clearInterval(interval); };
-  }, [jobIds, selectedItem]);
+      // On SSE error: fall back to a single REST poll to keep state fresh
+      es.onerror = () => {
+        es.close();
+        if (!active) return;
+        getAuthHeaders()
+          .then((headers) =>
+            fetch(`${API_URL}/jobs/${jid}`, { headers }).then((r) =>
+              r.ok ? r.json() : null
+            )
+          )
+          .then((data) => {
+            if (data && active) {
+              setJobStatuses((prev) => ({ ...prev, [jid]: data }));
+              // If job is done, stop the spinner
+              if (data.status !== "processing" && data.status !== "collecting") {
+                setIsProcessing(false);
+              }
+            }
+          })
+          .catch(() => {});
+      };
+    };
+
+    jobIds.forEach(connectSSE);
+
+    return () => {
+      active = false;
+      sources.forEach((es) => es.close());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobIds, sseKey]);
 
   const handleDragOver = (e: React.DragEvent) => e.preventDefault();
   const handleDrop = (e: React.DragEvent) => {
@@ -418,14 +438,16 @@ export default function BatchEditor() {
 
     try {
       const authHeaders = await getAuthHeaders();
-      await fetch(`${API_URL}/jobs/${targetJobId}/reprocess/${selectedItem.id}`, {
+      const res = await fetch(`${API_URL}/jobs/${targetJobId}/reprocess/${selectedItem.id}`, {
         method: "POST",
         headers: authHeaders,
         body: formData,
       });
-      // Will naturally update via polling interval!
+      if (!res.ok) throw new Error(`Server error ${res.status}`);
+      // Reconnect SSE so we receive live updates from the reprocess run
+      setSseKey((k) => k + 1);
     } catch (err) {
-      alert("Error triggering reprocess.");
+      alert("Erro ao reprocessar imagem.");
       setIsReprocessing(false);
     }
   };
