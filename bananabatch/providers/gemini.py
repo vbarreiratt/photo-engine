@@ -6,8 +6,11 @@ new google-genai SDK for image generation and editing with Gemini models.
 
 import asyncio
 import base64
+import io
 from pathlib import Path
 from typing import Any, Optional
+
+from PIL import Image, ImageOps
 
 from google import genai
 from google.genai import types
@@ -282,10 +285,6 @@ class GeminiProvider(ImageProvider):
         Returns:
             The edited image as raw bytes.
         """
-        # Read and encode the base image
-        with open(base_image, "rb") as f:
-            base_image_bytes = f.read()
-
         # Determine mime type from extension
         suffix = base_image.suffix.lower()
         mime_type = {
@@ -295,6 +294,22 @@ class GeminiProvider(ImageProvider):
             ".webp": "image/webp",
             ".gif": "image/gif",
         }.get(suffix, "image/png")
+
+        # Open and normalize EXIF orientation before sending to Gemini.
+        # Many phone photos are stored as landscape pixels with an EXIF rotation tag.
+        # Gemini may not apply the EXIF tag, so we normalize orientation explicitly.
+        img = Image.open(base_image)
+        img = ImageOps.exif_transpose(img)
+        pil_fmt_map = {
+            "image/png": "PNG", "image/jpeg": "JPEG",
+            "image/webp": "WEBP", "image/gif": "GIF",
+        }
+        pil_fmt = pil_fmt_map.get(mime_type, "PNG")
+        if pil_fmt == "JPEG" and img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format=pil_fmt, quality=95)
+        base_image_bytes = buf.getvalue()
 
         # Build the content parts
         contents = [

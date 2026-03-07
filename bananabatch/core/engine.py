@@ -18,7 +18,7 @@ from typing import Any, AsyncIterator, Callable, Optional
 
 import aiofiles
 import io
-from PIL import Image
+from PIL import Image, ImageOps
 from jinja2 import Environment, TemplateError, UndefinedError
 
 from bananabatch.core.models import (
@@ -753,31 +753,33 @@ class BatchEditProcessor:
 
     def _adjust_image_data(self, base_image_path: Path, generated_image_data: bytes) -> tuple[bytes, str]:
         """Restore original dimensions and format to the generated image."""
-        base_img = Image.open(base_image_path)
-        orig_size = base_img.size
-        orig_format = base_img.format or "JPEG"
+        base_img_raw = Image.open(base_image_path)
+        orig_format = base_img_raw.format or "JPEG"
         orig_ext = base_image_path.suffix.lower()
         if orig_ext not in [".jpg", ".jpeg", ".png", ".webp", ".gif"]:
             orig_ext = ".jpg" if orig_format in ["JPEG", "JPG"] else f".{orig_format.lower()}"
 
-        gen_img = Image.open(io.BytesIO(generated_image_data))
-        if gen_img.size != orig_size:
-            gen_img = gen_img.resize(orig_size, Image.Resampling.LANCZOS)
-        
-        if orig_format in ["JPEG", "JPG"] and gen_img.mode in ("RGBA", "P"):
-            gen_img = gen_img.convert("RGB")
-
-        exif = base_img.info.get('exif')
-        dpi = base_img.info.get('dpi', (300, 300))
+        dpi = base_img_raw.info.get('dpi', (300, 300))
         if dpi[0] < 150:
             dpi = (300, 300)
 
+        # Apply EXIF orientation to get the actual display dimensions.
+        # Without this, a portrait JPEG stored as landscape pixels (with EXIF rotation)
+        # would return the raw stored size, causing the output to be squished/distorted.
+        base_img = ImageOps.exif_transpose(base_img_raw)
+        orig_size = base_img.size
+
+        gen_img = Image.open(io.BytesIO(generated_image_data))
+        if gen_img.size != orig_size:
+            gen_img = gen_img.resize(orig_size, Image.Resampling.LANCZOS)
+
+        if orig_format in ["JPEG", "JPG"] and gen_img.mode in ("RGBA", "P"):
+            gen_img = gen_img.convert("RGB")
+
         out_buffer = io.BytesIO()
-        save_kwargs = {"format": orig_format, "quality": 100, "dpi": dpi}
-        if exif:
-            save_kwargs["exif"] = exif
-            
-        gen_img.save(out_buffer, **save_kwargs)
+        # Do not copy original EXIF — the output is already correctly oriented,
+        # so re-adding an orientation tag would cause display issues.
+        gen_img.save(out_buffer, format=orig_format, quality=100, dpi=dpi)
         return out_buffer.getvalue(), orig_ext
 
     async def _process_single_edit(self, request: ImageEditRequest) -> ImageResult:
