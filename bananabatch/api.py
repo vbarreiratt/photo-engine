@@ -528,7 +528,8 @@ async def _process_job(job_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-@app.post("/api/jobs/init")
+@app.post("/api/jobs")          # compat alias (old frontend)
+@app.post("/api/jobs/init")     # canonical v2 route
 async def init_job(
     total_files: int = Form(...),
     prompt: str = Form(...),
