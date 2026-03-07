@@ -18,7 +18,7 @@ export default defineConfig({
     proxy: {
       // In local dev (docker-compose.local.yml) proxy /api to the backend container
       '/api': {
-        target: 'http://backend:8000',
+        target: 'http://localhost:8000',
         changeOrigin: true,
       },
     },

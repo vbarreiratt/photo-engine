@@ -39,7 +39,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
@@ -72,6 +72,10 @@ _SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 _DB_DIR = Path(os.getenv("DB_DIR", "/app/data"))
 _DB_PATH = _DB_DIR / "bananabatch.db"
 _OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "/app/outputs"))
+
+# In production nginx handles file delivery via X-Accel-Redirect.
+# In local dev (no nginx) we serve files directly with FileResponse.
+_USE_NGINX_ACCEL = os.getenv("USE_NGINX_ACCEL", "0") == "1"
 
 MAX_RETRIES = 3
 
@@ -185,6 +189,23 @@ async def db_update_job(job_id: str, **kwargs):
     cols = ", ".join(f"{k} = ?" for k in kwargs)
     vals = list(kwargs.values()) + [job_id]
     await _db(f"UPDATE jobs SET {cols} WHERE id = ?", tuple(vals), commit=True)
+
+
+async def db_append_item(job_id: str, item: dict) -> int:
+    """Atomically append an item to the job's items array. Returns new count."""
+    async with aiosqlite.connect(str(_DB_PATH)) as conn:
+        await conn.execute("PRAGMA journal_mode=WAL")
+        # json_insert with '$[#]' appends atomically inside SQLite
+        await conn.execute(
+            "UPDATE jobs SET items = json_insert(items, '$[#]', json(?)) WHERE id = ?",
+            (json.dumps(item), job_id),
+        )
+        await conn.commit()
+        async with conn.execute(
+            "SELECT json_array_length(items) FROM jobs WHERE id = ?", (job_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
 
 
 async def db_update_item(job_id: str, item_id: str, **kwargs):
@@ -547,12 +568,10 @@ async def upload_file(
     with open(file_path, "wb") as out:
         shutil.copyfileobj(file.file, out)
 
-    items = job["items"]
     item_id = str(uuid.uuid4())
-    items.append({"id": item_id, "filename": safe_name, "status": "queued"})
-    received = len(items)
     total = job["total_files"]
-    await db_update_job(job_id, items=items)
+    # Atomic append — no read-modify-write race with concurrent uploads
+    received = await db_append_item(job_id, {"id": item_id, "filename": safe_name, "status": "queued"})
 
     log.info("[%s] %s received (%d/%d)", job_id[:8], safe_name, received, total)
 
@@ -638,13 +657,17 @@ async def get_file(job_id: str, filename: str, user: dict = Depends(require_auth
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
-    # URL-encode so Portuguese accented names (ã, ã, ã…) survive as ASCII in the header
-    encoded = quote(safe_name, safe="")
-    return Response(
-        content=b"",
-        status_code=200,
-        headers={"X-Accel-Redirect": f"/internal-outputs/{job_id}/{encoded}"},
-    )
+    if _USE_NGINX_ACCEL:
+        # Production: let nginx serve the file via X-Accel-Redirect (faster, no Python I/O)
+        # URL-encode so Portuguese accented names survive as ASCII in the header
+        encoded = quote(safe_name, safe="")
+        return Response(
+            content=b"",
+            status_code=200,
+            headers={"X-Accel-Redirect": f"/internal-outputs/{job_id}/{encoded}"},
+        )
+    # Local dev: serve the file directly from Python
+    return FileResponse(path=file_path, filename=safe_name)
 
 
 @app.get("/api/jobs/{job_id}/download")
