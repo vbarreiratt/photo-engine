@@ -589,7 +589,7 @@ async def get_job(job_id: str, user: dict = Depends(require_auth)):
         raise HTTPException(status_code=404, detail="Job not found")
     if job["owner_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Access denied")
-    return job
+    return {**job, "job_id": job["id"]}
 
 
 @app.get("/api/jobs/{job_id}/events")
